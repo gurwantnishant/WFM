@@ -625,17 +625,15 @@ function getMonthBandwidth(empId) {
 // QUALITY & PERFORMANCE SCORES
 // ═══════════════════════════════════════════════════════════
 function getQualityScore(empId, year, month) {
-  let score = 100;
-  const reviews = STATE.qualityReviews.filter(r=>r.employeeId===empId && r.year===year && r.month===month);
-  reviews.forEach(r=>{
-    if(r.result==='Rework Required') score -= 3;
-    if(r.result==='Failed') score -= 10;
-    if(r.severity==='Low') score -= 2;
-    if(r.severity==='Medium') score -= 5;
-    if(r.severity==='High') score -= 10;
-    if(r.lateDelivery) score -= 5;
-  });
-  return Math.max(0, Math.min(100, score));
+  // Quality score now comes entirely from requestor survey feedback (per
+  // team decision) rather than manually-logged Quality Reviews. Manual
+  // reviews (and auto-generated ones from survey responses — see
+  // saveSurveyResponse()) still show up in the Quality Management log for
+  // visibility/audit purposes, they just no longer move this number.
+  // Defined here as its own function (rather than every caller reaching for
+  // getSurveyScore directly) so a future change back to a blended score only
+  // needs to happen in one place.
+  return getSurveyScore(empId, year, month);
 }
 
 function getSurveyScore(empId, year, month) {
@@ -661,8 +659,11 @@ function getPerformanceScore(empId, year, month) {
   const adhocDone = myAdhoc.filter(t=>t.status==='Completed').length;
   const adhocScore = myAdhoc.length>0 ? (adhocDone/myAdhoc.length)*100 : 100;
 
-  // Quality (20%)
-  const qScore = getQualityScore(empId, year, month);
+  // Quality & Requestor Survey Feedback (35% combined) — getQualityScore()
+  // is now itself defined as the survey score, so this is a single signal,
+  // not two independent ones. Combined into one weighted term below instead
+  // of adding qScore*.20 + surveyScore*.15 as if they were different numbers.
+  const feedbackScore = getSurveyScore(empId, year, month); // === getQualityScore(empId, year, month)
 
   // Utilization efficiency (10%)
   const bw = getMonthBandwidth(empId);
@@ -674,10 +675,7 @@ function getPerformanceScore(empId, year, month) {
   const unplanned = leaves.filter(l=>l.type==='Unplanned').length;
   const attScore = Math.max(0, 100 - unplanned*15);
 
-  // Requestor Survey Feedback (15%)
-  const surveyScore = getSurveyScore(empId, year, month);
-
-  const final = regScore*.30 + adhocScore*.20 + qScore*.20 + utilScore*.10 + attScore*.05 + surveyScore*.15;
+  const final = regScore*.30 + adhocScore*.20 + feedbackScore*.35 + utilScore*.10 + attScore*.05;
   return Math.round(final);
 }
 
@@ -686,13 +684,18 @@ function getPerformanceScore(empId, year, month) {
 // ═══════════════════════════════════════════════════════════
 function dashboard() {
   const y=STATE.currentYear, m=STATE.currentMonth;
-  const activeEmps = visibleEmployees().filter(e=>e.status==='active');
+  const allActiveEmps = visibleEmployees().filter(e=>e.status==='active');
+  // Managers excluded from every individual/aggregate performance, quality,
+  // and utilization figure below — a manager's numbers are reflected via
+  // their team's results, not shown as their own row/score. "Total
+  // Employees" headcount above still counts everyone, including managers.
+  const activeEmps = allActiveEmps.filter(e=>e.role!=='manager');
   const todayStr = today();
   const wds = getWorkingDays(y,m);
   const todayWds = wds.filter(d=>d<=todayStr);
 
   // KPIs
-  const totalEmps = activeEmps.length;
+  const totalEmps = allActiveEmps.length;
   const totalReg = STATE.regularReports.length;
   const visEmpIds = visibleEmployees().map(e=>e.id);
   const totalAdhoc = STATE.adhocTasks.filter(t=>{
@@ -934,7 +937,9 @@ function buildLeaveChart(emps, y, m) {
 // ═══════════════════════════════════════════════════════════
 function capacity() {
   const y=STATE.currentYear, m=STATE.currentMonth;
-  const activeEmps = visibleEmployees().filter(e=>e.status==='active');
+  // Managers excluded — capacity/utilization here is an individual workload
+  // metric, and a manager's contribution is reflected via their team instead.
+  const activeEmps = visibleEmployees().filter(e=>e.status==='active' && e.role!=='manager');
   const daysInM = daysInMonth(y,m);
   const dayHeaders = [];
   for(let i=1;i<=daysInM;i++){
@@ -1314,7 +1319,12 @@ async function saveEmployee(id) {
       newAuthUid = await createEmployeeAuthAccount(fields.email, tempPassword);
       toast('Login account created for ' + fields.email, 'success');
     } catch(err) {
-      toast('Could not create login: ' + (err.message || err.code || 'unknown error'), 'error');
+      const msg = err.message || err.code || 'unknown error';
+      if(/rate limit/i.test(msg) && /email/i.test(msg)) {
+        toast('Email rate limit hit — Supabase\'s default email service caps confirmation emails per hour. If you don\'t need employees to confirm by email, turn off "Confirm email" under Authentication → Providers → Email in your Supabase Dashboard, then try again.', 'error');
+      } else {
+        toast('Could not create login: ' + msg, 'error');
+      }
       return;
     }
   }
@@ -1354,9 +1364,33 @@ function sendEmployeePasswordReset(id) {
 
 function deleteEmployee(id) {
   if(!confirm('Delete this employee? This cannot be undone.')) return;
+
   STATE.employees = STATE.employees.filter(e=>e.id!==id);
+
+  // Regular-report assignments only exist to link this employee to a
+  // report — remove them entirely.
   STATE.assignments = STATE.assignments.filter(a=>a.employeeId!==id);
-  save(); toast('Employee deleted','info'); employees();
+
+  // Personal records that belong to this employee specifically — leaves,
+  // quality reviews (manual + auto-generated from surveys), and survey
+  // responses. These are the employee's "details" and shouldn't linger
+  // in Supabase referencing an ID that no longer exists.
+  STATE.leaves          = STATE.leaves.filter(l=>l.employeeId!==id);
+  STATE.qualityReviews  = STATE.qualityReviews.filter(r=>r.employeeId!==id);
+  STATE.surveyResponses = STATE.surveyResponses.filter(r=>r.employeeId!==id);
+
+  // Work items (adhoc tasks, project tasks/projects) are organizational
+  // records, not the employee's own data — unassign rather than delete, so
+  // the task/project and its history survive and can be handed to someone
+  // else instead of silently disappearing.
+  STATE.adhocTasks.forEach(t=>{ if(t.assignedTo===id) t.assignedTo = null; });
+  STATE.pmTasks.forEach(t=>{
+    if(t.assigneeId===id)  t.assigneeId  = null;
+    if(t.reporterId===id)  t.reporterId  = null;
+  });
+  STATE.pmProjects.forEach(p=>{ if(p.ownerId===id) p.ownerId = null; });
+
+  save(); toast('Employee and their records deleted','info'); employees();
 }
 
 function viewEmployee(id) {
@@ -1763,6 +1797,7 @@ function adhoc() {
                   <button class="btn btn-secondary btn-sm" onclick="openAdhocModal('${t.id}')">Edit</button>
                   <button class="btn btn-teal btn-sm" onclick="updateTaskStatus('${t.id}')">Status</button>
                   ${t.status==='Completed' ? `<button class="btn btn-secondary btn-sm" onclick="sendSurveyEmailToOutlook('${t.id}')" title="Open a new Outlook email to the requestor with the click-to-reply survey copied to your clipboard">✉ Email</button>` : ''}
+                  ${t.status==='Completed' ? `<button class="btn btn-secondary btn-sm" onclick="copySurveyToClipboard('${t.id}')" title="Re-copy the survey if it didn't paste in last time">⧉ Copy Survey</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-primary btn-sm" onclick="openSurveyModal('${t.id}')">${survey ? '★ Update' : '★ Record'}</button>` : ''}
                   <button class="btn btn-danger btn-sm" onclick="deleteAdhoc('${t.id}')">✕</button>
                 </div></td>
@@ -2166,35 +2201,60 @@ function buildSurveyEmailHtml(task) {
 </table>`;
 }
 
-function sendSurveyEmailToOutlook(taskId) {
+// Copies the click-to-reply HTML survey to the clipboard and reports whether
+// it actually succeeded. Split out from sendSurveyEmailToOutlook() so it can
+// also be used as a manual "Copy Survey" retry button if the first copy
+// silently failed (e.g. clipboard permission blocked) or got overwritten
+// before the user pasted it.
+async function copySurveyToClipboard(taskId, { silent } = {}) {
+  const task = STATE.adhocTasks.find(t=>t.id===taskId);
+  if(!task) return false;
+  const html = buildSurveyEmailHtml(task);
+  const plain = `How did we do?\n\n1. How satisfied are you with the overall support (1-5)?\n2. Was it delivered within the expected timeline (Yes/No)?\n3. How would you rate quality, accuracy & completeness (1-5)?\n4. What could we do better for future requests?`;
+  try {
+    if(!navigator.clipboard || !window.ClipboardItem) throw new Error('Clipboard API unavailable');
+    const item = new ClipboardItem({
+      'text/html': new Blob([html], {type:'text/html'}),
+      'text/plain': new Blob([plain], {type:'text/plain'})
+    });
+    // Awaited (not fire-and-forget) so callers know the copy actually landed
+    // before doing anything that assumes it did (e.g. opening Outlook).
+    await navigator.clipboard.write([item]);
+    if(!silent) toast('✓ Survey copied — press Ctrl+V in Outlook, then Send', 'success');
+    return true;
+  } catch(e) {
+    console.warn('[SURVEY] Clipboard copy failed:', e);
+    if(!silent) toast('Copy failed — your browser may be blocking clipboard access. Try the "Copy Survey" button again, or allow clipboard permission for this site.', 'error');
+    return false;
+  }
+}
+
+async function sendSurveyEmailToOutlook(taskId) {
   const task = STATE.adhocTasks.find(t=>t.id===taskId);
   if(!task) return;
   if(!task.requestorEmail) {
     toast('Add a Requestor Email on this task first so I know who to send the survey to', 'info');
     return;
   }
-  const html = buildSurveyEmailHtml(task);
-  const plain = `How did we do?\n\n1. How satisfied are you with the overall support (1-5)?\n2. Was it delivered within the expected timeline (Yes/No)?\n3. How would you rate quality, accuracy & completeness (1-5)?\n4. What could we do better for future requests?`;
 
-  // Best-effort: copy the click-to-reply HTML survey to the clipboard so it can be
-  // pasted straight into the Outlook draft. Browsers can't inject HTML into an
-  // external app's compose window directly (mailto: only carries plain text),
-  // so this paste is the one unavoidable manual step.
-  try {
-    if(navigator.clipboard && window.ClipboardItem) {
-      const item = new ClipboardItem({
-        'text/html': new Blob([html], {type:'text/html'}),
-        'text/plain': new Blob([plain], {type:'text/plain'})
-      });
-      navigator.clipboard.write([item]).catch(()=>{});
-    }
-  } catch(e) { /* clipboard unavailable — Outlook still opens, body note covers it */ }
+  // Wait for the copy to actually finish (or fail) before opening Outlook —
+  // previously this fired the clipboard write and the mailto: navigation at
+  // the same time, so on a slow/first write the clipboard could still be
+  // empty by the time the user hit Ctrl+V.
+  const copied = await copySurveyToClipboard(taskId, { silent: true });
 
   const subject = `Feedback Request: ${task.name} — Ad-hoc Support Survey`;
-  const body = `(Your one-click survey is on your clipboard — press Ctrl+V right here to paste it in, then hit Send.)`;
+  const body = copied
+    ? `(Your one-click survey is on your clipboard — press Ctrl+V right here to paste it in, then hit Send.)`
+    : `(Auto-copy didn't go through — click the "Copy Survey" button next to this task, then paste it here with Ctrl+V before sending.)`;
   const mailtoLink = `mailto:${task.requestorEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   window.location.href = mailtoLink;
-  toast(`Outlook opening for ${task.requestorEmail} — press Ctrl+V to paste the survey, then Send`, 'success');
+
+  if(copied) {
+    toast(`✓ Copied — Outlook opening for ${task.requestorEmail}. Press Ctrl+V, then Send.`, 'success');
+  } else {
+    toast(`Outlook opening for ${task.requestorEmail}, but the auto-copy failed — use "Copy Survey" to retry, then paste manually`, 'error');
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2257,6 +2317,17 @@ function pickSurveyValue(groupId, val) {
   });
 }
 
+// Maps a 0-100 survey score to Quality Review fields, so a requestor's
+// feedback shows up in Quality Management the same way a manually-logged
+// review would. Uses the same 80/60 cutoffs as the score color-coding
+// elsewhere in the app (green/amber/red) — change here if auto-generated
+// reviews should use different thresholds than the score display does.
+function surveyScoreToQualityFields(score, onTime) {
+  const result   = score >= 80 ? 'Passed' : score >= 60 ? 'Rework Required' : 'Failed';
+  const severity = score >= 80 ? ''       : score >= 60 ? 'Low'             : score >= 40 ? 'Medium' : 'High';
+  return { result, severity, lateDelivery: !onTime };
+}
+
 function saveSurveyResponse(taskId) {
   const task = STATE.adhocTasks.find(t=>t.id===taskId);
   if(!task) return;
@@ -2289,6 +2360,29 @@ function saveSurveyResponse(taskId) {
   };
   if(existingIdx>-1) STATE.surveyResponses[existingIdx] = record;
   else STATE.surveyResponses.push(record);
+
+  // Also log this as a Quality Review so it's visible in Quality Management,
+  // not just folded silently into the score. Matched on
+  // (linkedTaskId + source:'survey') so re-recording the same task's survey
+  // updates that one entry instead of piling up duplicates each time.
+  const qFields = surveyScoreToQualityFields(score, onTime);
+  const qIdx = STATE.qualityReviews.findIndex(r=>r.linkedTaskId===taskId && r.source==='survey');
+  const qReview = {
+    id: qIdx>-1 ? STATE.qualityReviews[qIdx].id : uid(),
+    employeeId: task.assignedTo,
+    taskName: task.name,
+    linkedTaskId: taskId,
+    linkedReportId: null,
+    result: qFields.result,
+    severity: qFields.severity,
+    errorCount: qIdx>-1 ? (STATE.qualityReviews[qIdx].errorCount||0) : 0,
+    lateDelivery: qFields.lateDelivery,
+    reviewDate: today(),
+    year: task.year, month: task.month,
+    source: 'survey' // marks this as auto-generated from a requestor survey rather than entered manually
+  };
+  if(qIdx>-1) STATE.qualityReviews[qIdx] = qReview;
+  else STATE.qualityReviews.push(qReview);
 
   save(); closeModal();
   toast(`Survey recorded — average score ${score}/100`, 'success');
@@ -2455,7 +2549,7 @@ function quality() {
               const emp=STATE.employees.find(e=>e.id===r.employeeId);
               return `<tr>
                 <td><strong>${emp?.name||'—'}</strong></td>
-                <td>${r.taskName||'—'}</td>
+                <td>${r.taskName||'—'}${r.source==='survey' ? ' <span class="badge badge-teal" title="Auto-generated from the requestor survey">Auto</span>' : ''}</td>
                 <td><span class="badge ${r.result==='Passed'?'badge-green':r.result==='Rework Required'?'badge-amber':'badge-red'}">${r.result}</span></td>
                 <td style="font-weight:600">${r.errorCount||0}</td>
                 <td><span class="badge ${r.severity==='Low'?'badge-teal':r.severity==='Medium'?'badge-amber':'badge-red'}">${r.severity||'None'}</span></td>
@@ -2663,7 +2757,13 @@ function deleteQual(id) {
 // ═══════════════════════════════════════════════════════════
 function performance() {
   const y=STATE.currentYear, m=STATE.currentMonth;
-  const activeEmps = visibleEmployees().filter(e=>e.status==='active');
+  // Managers are excluded from individual performance scoring — a manager's
+  // performance is reflected through their team's aggregate numbers, not an
+  // individual score card/leaderboard row. This also means a manager viewing
+  // their own Performance tab sees no personal card, since visibleEmployees()
+  // for a manager includes their own record (same team), and this filter
+  // removes it.
+  const activeEmps = visibleEmployees().filter(e=>e.status==='active' && e.role!=='manager');
 
   const content = document.getElementById('content');
   content.innerHTML = `
@@ -2696,10 +2796,9 @@ function performance() {
           <div style="font-size:12px;color:var(--text3);margin-bottom:8px">Score Breakdown</div>
           ${scoreBar('Regular Reports (30%)', 100, 30, '#4F46E5')}
           ${scoreBar('Adhoc Tasks (20%)', myAdhoc.length?Math.round(adhocDone/myAdhoc.length*100):100, 20, '#0D9488')}
-          ${scoreBar('Quality Score (20%)', qs, 20, '#F59E0B')}
+          ${scoreBar('Quality & Requestor Survey (35%)', qs, 35, '#F59E0B')}
           ${scoreBar('Utilization (10%)', bw.pct, 10, '#0EA5E9')}
           ${scoreBar('Attendance (5%)', Math.max(0,100-leaves.filter(l=>l.type==='Unplanned').length*15), 5, '#22C55E')}
-          ${scoreBar('Requestor Survey (15%)', getSurveyScore(e.id,y,m), 15, '#EC4899')}
         </div>`;
       }).join('')}
     </div>
@@ -2709,14 +2808,13 @@ function performance() {
       <div class="table-wrap"><table>
         <thead><tr>
           <th>#</th><th>Employee</th><th>Team</th>
-          <th>Reg. Reports</th><th>Adhoc Done</th><th>Quality</th>
-          <th>Utilization</th><th>Survey</th><th>Perf Score</th><th>Grade</th>
+          <th>Reg. Reports</th><th>Adhoc Done</th><th>Quality/Survey</th>
+          <th>Utilization</th><th>Perf Score</th><th>Grade</th>
         </tr></thead>
         <tbody>
           ${activeEmps.sort((a,b)=>getPerformanceScore(b.id,y,m)-getPerformanceScore(a.id,y,m)).map((e,i)=>{
             const ps=getPerformanceScore(e.id,y,m);
             const qs=getQualityScore(e.id,y,m);
-            const svScore=getSurveyScore(e.id,y,m);
             const pl=perfLabel(ps);
             const bw=getEmployeeBandwidth(e.id,today());
             const myA=STATE.adhocTasks.filter(t=>t.assignedTo===e.id&&t.year===y&&t.month===m);
@@ -2736,7 +2834,6 @@ function performance() {
                   <span style="font-size:12px">${bw.pct}%</span>
                 </div>
               </td>
-              <td><span class="badge badge-teal">${svScore}/100</span></td>
               <td><strong style="font-size:16px;color:var(--primary)">${ps}</strong></td>
               <td><span class="badge ${pl.cls}">${pl.label}</span></td>
             </tr>`;
