@@ -1,6 +1,6 @@
 /* ============================================================
    DESIGN TOKENS
-   Palette: slate-white base, indigo primary, amber accent,
+   Palette: slate-white base, PWMS blue primary, amber accent,
    teal for performance, coral for alerts
    ============================================================ */
 :root {
@@ -8,9 +8,9 @@
   --surface:     #FFFFFF;
   --surface2:    #F0F2FA;
   --border:      #E2E6F0;
-  --primary:     #4F46E5;
-  --primary-lt:  #EEF2FF;
-  --primary-dk:  #3730A3;
+  --primary:     #0B4EA2;
+  --primary-lt:  #E8F0FA;
+  --primary-dk:  #073A7A;
   --accent:      #F59E0B;
   --accent-lt:   #FEF3C7;
   --teal:        #0D9488;
@@ -23,8 +23,8 @@
   --text2:       #4B5563;
   --text3:       #9CA3AF;
   --shadow-sm:   0 1px 3px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.05);
-  --shadow:      0 4px 16px rgba(79,70,229,.08), 0 1px 4px rgba(0,0,0,.06);
-  --shadow-lg:   0 10px 32px rgba(79,70,229,.12);
+  --shadow:      0 4px 16px rgba(11,78,162,.08), 0 1px 4px rgba(0,0,0,.06);
+  --shadow-lg:   0 10px 32px rgba(11,78,162,.12);
   --radius:      12px;
   --radius-sm:   8px;
   --radius-lg:   16px;
@@ -75,7 +75,6 @@ body {
   letter-spacing: -.3px;
   flex-shrink: 0;
 }
-.sidebar-logo span { color: var(--accent); }
 .sidebar-logo svg { flex-shrink: 0; }
 .sidebar-section-label {
   font-size: 10px;
@@ -314,7 +313,7 @@ tbody td { padding: 10px 14px; color: var(--text); vertical-align: middle; }
   white-space: nowrap;
 }
 .btn-primary { background: var(--primary); color: #fff; }
-.btn-primary:hover { background: var(--primary-dk); box-shadow: 0 4px 12px rgba(79,70,229,.3); }
+.btn-primary:hover { background: var(--primary-dk); box-shadow: 0 4px 12px rgba(11,78,162,.3); }
 .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover { background: var(--border); }
 .btn-danger { background: var(--coral-lt); color: var(--coral); }
@@ -342,7 +341,7 @@ tbody td { padding: 10px 14px; color: var(--text); vertical-align: middle; }
   outline: none;
   width: 100%;
 }
-.form-control:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79,70,229,.1); }
+.form-control:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(11,78,162,.1); }
 select.form-control { cursor: pointer; }
 textarea.form-control { resize: vertical; min-height: 72px; }
 
@@ -444,7 +443,7 @@ textarea.form-control { resize: vertical; min-height: 72px; }
   display: flex; align-items: flex-start; gap: 8px;
   margin-bottom: 12px;
 }
-.alert-info { background: var(--primary-lt); color: var(--primary); border: 1px solid #C7D2FE; }
+.alert-info { background: var(--primary-lt); color: var(--primary); border: 1px solid #BBD6F0; }
 .alert-warn { background: var(--accent-lt); color: #92400E; border: 1px solid #FDE68A; }
 .alert-success { background: var(--green-lt); color: #15803D; border: 1px solid #BBF7D0; }
 .alert-error { background: var(--coral-lt); color: #B91C1C; border: 1px solid #FECACA; }
@@ -549,7 +548,7 @@ textarea.form-control { resize: vertical; min-height: 72px; }
 }
 .toast.success { background: #064E3B; border-left: 3px solid var(--green); }
 .toast.error   { background: #7F1D1D; border-left: 3px solid var(--coral); }
-.toast.info    { background: #1E1B4B; border-left: 3px solid var(--primary); }
+.toast.info    { background: #0A2E52; border-left: 3px solid var(--primary); }
 @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
 /* DIVIDER */
@@ -565,7 +564,7 @@ tr:hover .inline-actions { opacity: 1; }
   padding: 3px 10px; border-radius: 99px;
   background: var(--primary-lt); color: var(--primary);
   font-size: 11px; font-weight: 600;
-  border: 1px solid #C7D2FE;
+  border: 1px solid #BBD6F0;
   white-space: nowrap;
 }
 .skill-tag .skill-tag-remove {
@@ -602,7 +601,7 @@ tr:hover .inline-actions { opacity: 1; }
 /* ── LOGIN SCREEN ─────────────────────────────────── */
 #login-screen {
   display:none; position:fixed; inset:0;
-  background:linear-gradient(135deg,#4F46E5 0%,#0D9488 100%);
+  background:linear-gradient(135deg,#0B4EA2 0%,#4FA8E8 100%);
   z-index:9999; align-items:center; justify-content:center;
 }
 #login-screen.active { display:flex; }
@@ -612,17 +611,18 @@ tr:hover .inline-actions { opacity: 1; }
 }
 .login-logo {
   display:flex; align-items:center; gap:10px;
-  font-size:22px; font-weight:800; color:#4F46E5; margin-bottom:32px;
+  font-size:22px; font-weight:800; color:#0B4EA2; margin-bottom:6px;
 }
 .login-logo svg { flex-shrink:0; }
+.login-logo-sub { font-size:12px; font-weight:500; color:#5B6B7C; margin-bottom:26px; }
 .login-title { font-size:20px; font-weight:700; color:#1E293B; margin-bottom:4px; }
 .login-sub   { font-size:13px; color:#64748B; margin-bottom:28px; }
 .login-field { margin-bottom:18px; }
 .login-field label { display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:6px; text-transform:uppercase; letter-spacing:.05em; }
 .login-field input { width:100%; padding:11px 14px; border:1.5px solid #E2E8F0; border-radius:8px; font-size:14px; outline:none; box-sizing:border-box; transition:border-color .15s; }
-.login-field input:focus { border-color:#4F46E5; }
-.login-btn { width:100%; padding:12px; background:#4F46E5; color:#fff; border:none; border-radius:8px; font-size:15px; font-weight:700; cursor:pointer; margin-top:8px; transition:background .15s; }
-.login-btn:hover { background:#4338CA; }
+.login-field input:focus { border-color:#0B4EA2; }
+.login-btn { width:100%; padding:12px; background:#0B4EA2; color:#fff; border:none; border-radius:8px; font-size:15px; font-weight:700; cursor:pointer; margin-top:8px; transition:background .15s; }
+.login-btn:hover { background:#073A7A; }
 .login-error { background:#FEE2E2; color:#DC2626; font-size:13px; padding:10px 14px; border-radius:8px; margin-bottom:16px; display:none; }
 .login-error.show { display:block; }
 .login-hint { font-size:11px; color:#94A3B8; text-align:center; margin-top:18px; }
@@ -638,7 +638,7 @@ tr:hover .inline-actions { opacity: 1; }
 .user-role-badge {
   font-size:10px; font-weight:700; padding:2px 7px; border-radius:99px; text-transform:uppercase; letter-spacing:.05em;
 }
-.role-admin   { background:#EEF2FF; color:#4F46E5; }
+.role-admin   { background:#E8F0FA; color:#0B4EA2; }
 .role-manager { background:#CCFBF1; color:#0D9488; }
 .role-member  { background:#FEF3C7; color:#D97706; }
 

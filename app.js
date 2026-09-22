@@ -1,5 +1,5 @@
 /* ============================================================
-   WORKPULSE — Enterprise Performance Tracker
+   PWMS — Panasonic Workforce Management Suite
    Supabase (Postgres + Auth + Realtime) persistence, Chart.js visuals
    ============================================================ */
 
@@ -81,6 +81,7 @@ const STATE = {
   pmView: 'dashboard', // UI-only: active top-level Projects view — dashboard | board | kanban
   pmDetailTab: 'overview', // UI-only: active tab within a project's detail page
   pmBoard: { sortKey:'name', sortDir:'asc', search:'', filterStatus:'', filterHealth:'', groupBy:'none', selected:[] }, // UI-only board view state
+  notifications: [], // in-app activity log — {id,type,title,message,taskId,read,createdAt}, newest first, capped at 200
   charts: {}
 };
 
@@ -109,7 +110,7 @@ const STATE = {
 //   create policy "Authenticated can update" on workpulse_data for update using (auth.role() = 'authenticated');
 //   alter publication supabase_realtime add table workpulse_data;  -- enables realtime for this table
 //
-const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','pmProjects','pmTasks'];
+const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','pmProjects','pmTasks','notifications'];
 const DATA_TABLE = 'workpulse_data';
 
 let _realtimeChannel = null;
@@ -191,6 +192,7 @@ async function startSync(onReady) {
       console.log('[SUPABASE] Realtime change:', row.key, '(' + payload.eventType + ')');
       _applyRow(row.key, row.data);
       if(!isSaving) setSyncStatus('connected');
+      if(row.key === 'notifications') updateNotificationBadge();
       if(_initialLoadDone) render();
     })
     .subscribe(status => {
@@ -222,13 +224,26 @@ function stopSync() {
 // tab could silently overwrite another tab's newer edit to a row it never
 // even touched. Diffing against _remoteCache means a tab only ever writes
 // the key(s) it actually changed, never clobbering rows it didn't touch.
+// Writes collections + settings back to Supabase in one upsert — but ONLY
+// the rows whose content actually differs from the last known Supabase
+// state (_remoteCache). This is the key fix carried over from the Firestore
+// version: writing every row unconditionally on every save() meant a stale
+// tab could silently overwrite another tab's newer edit to a row it never
+// even touched. Diffing against _remoteCache means a tab only ever writes
+// the key(s) it actually changed, never clobbering rows it didn't touch.
+//
+// Returns a Promise that resolves once the write actually lands (or
+// immediately if there was nothing to save). Callers that need to do
+// something navigation-risky right after saving — e.g. firing a mailto:
+// link, which can interrupt an in-flight request in some browsers — should
+// `await save()` first rather than treating it as fire-and-forget.
 function save() {
   if(isLoading) {
     // Should not be reachable — the login/app UI stays hidden until initial
     // load completes — but this is the hard backstop against ever writing
     // a half-loaded/empty STATE over real Supabase data.
     console.warn('[SUPABASE] save() called before initial data finished loading — ignoring to protect existing data');
-    return;
+    return Promise.resolve();
   }
   const changes = [];
   DATA_DOC_KEYS.forEach(key => {
@@ -239,13 +254,13 @@ function save() {
   if(JSON.stringify(STATE.settings) !== JSON.stringify(_remoteCache.settings)) {
     changes.push({ key: 'settings', data: STATE.settings });
   }
-  if(changes.length===0) { console.log('[SUPABASE] save() called with no changes — skipping write'); return; }
+  if(changes.length===0) { console.log('[SUPABASE] save() called with no changes — skipping write'); return Promise.resolve(); }
 
   const changedKeys = changes.map(c => c.key);
   console.log('[SUPABASE] Saving', changedKeys.join(', '));
   isSaving = true;
   setSyncStatus('saving');
-  sb.from(DATA_TABLE).upsert(changes, { onConflict: 'key' }).then(({ error }) => {
+  return sb.from(DATA_TABLE).upsert(changes, { onConflict: 'key' }).then(({ error }) => {
     isSaving = false;
     if(error) {
       // A failed write must never be reported as a success elsewhere — this
@@ -257,6 +272,16 @@ function save() {
     } else {
       console.log('[SUPABASE] Save successful:', changedKeys.join(', '));
       setSyncStatus('saved');
+      // Update _remoteCache immediately rather than waiting on the realtime
+      // echo of this write to come back and call _applyRow(). Waiting on
+      // the echo left a window where a second save() fired right after
+      // (e.g. the notification log write that follows an ad-hoc acceptance)
+      // would re-diff against stale data and re-send a row that had, in
+      // fact, already saved successfully.
+      changes.forEach(c => {
+        if(c.key === 'settings') _remoteCache.settings = _clone(STATE.settings);
+        else _remoteCache[c.key] = _clone(STATE[c.key]);
+      });
     }
   });
 }
@@ -473,6 +498,7 @@ function resolveAuthUser(user) {
 function afterLogin() {
   hideLogin();
   updateUserBadge();
+  updateNotificationBadge();
   navigate('dashboard');
 }
 
@@ -533,6 +559,29 @@ function isManager() { return STATE.currentUser?.role === 'manager'; }
 function isMember()  { return STATE.currentUser?.role === 'member'; }
 function myEmpId()   { return STATE.currentUser?.empId; }
 function myTeam()    { return STATE.currentUser?.team; }
+
+// Adhoc assignment workflow
+const SALES_ORGS = ['BCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
+const ADHOC_ASSIGNMENT_STATUSES = ['Pending Acceptance','Accepted','Rejected'];
+
+function taskAssignmentLabel(t) {
+  return t.assignmentStatus || (t.status === 'Rejected' ? 'Rejected' : 'Accepted');
+}
+
+function isTaskPendingAcceptance(t) {
+  return taskAssignmentLabel(t) === 'Pending Acceptance';
+}
+
+function taskManagerName(t) {
+  const emp = STATE.employees.find(e=>e.id===t.assignedTo);
+  return t.assignedByName || emp?.manager || '';
+}
+
+function assignmentBadge(status) {
+  const map = {'Pending Acceptance':'badge-amber','Accepted':'badge-green','Rejected':'badge-red'};
+  return `<span class=\"badge ${map[status]||'badge-gray'}\">${status||'—'}</span>`;
+}
+
 
 // Filter employees visible to current user
 function visibleEmployees() {
@@ -733,26 +782,39 @@ function dashboard() {
   if(isMember()) {
     const me = STATE.employees.find(e=>e.id===myEmpId());
     const bw = me ? getEmployeeBandwidth(me.id, todayStr) : {};
-    const myTasks = STATE.adhocTasks.filter(t=>t.assignedTo===myEmpId() && !['Completed','Cancelled'].includes(t.status));
+    const myTasks = STATE.adhocTasks.filter(t=>t.assignedTo===myEmpId() && !['Completed','Cancelled','Rejected'].includes(t.status));
+    const pendingRequests = STATE.adhocTasks.filter(t=>t.assignedTo===myEmpId() && isTaskPendingAcceptance(t));
     const perfScore = me ? getPerformanceScore(me.id, y, m) : 0;
     const qualScore = me ? getQualityScore(me.id, y, m) : 100;
     content.innerHTML = `
       <div class="section-header"><h2>My Dashboard</h2></div>
       <div class="kpi-grid" style="grid-template-columns:repeat(4,1fr)">
-        ${kpiCard('Performance', perfScore, selectedMonthLabel(), '#4F46E5','#EEF2FF', svgFlash())}
+        ${kpiCard('Performance', perfScore, selectedMonthLabel(), '#0B4EA2','#EEF2FF', svgFlash())}
         ${kpiCard('Quality Score', qualScore, selectedMonthLabel(), '#0D9488','#CCFBF1', svgStar())}
         ${kpiCard('Available Today', (bw.available||0).toFixed(1)+'h', 'of '+(bw.total||8)+'h', '#22C55E','#DCFCE7', svgClock())}
-        ${kpiCard('Open Tasks', myTasks.length, 'Assigned to me', '#F59E0B','#FEF3C7', svgDoc())}
+        ${kpiCard('Open Tasks', myTasks.filter(t=>!isTaskPendingAcceptance(t)).length, 'Accepted / active', '#F59E0B','#FEF3C7', svgDoc())}
+        ${kpiCard('Pending Requests', pendingRequests.length, 'Awaiting your response', '#8B5CF6','#F5F3FF', svgFlash())}
       </div>
+      ${pendingRequests.length ? `<div class="card" style="margin-top:20px;border:1px solid #E9D5FF">
+        <div class="card-header"><div><div class="card-title">Ad Hoc Assignment Requests</div><div style="font-size:12px;color:var(--text3);margin-top:3px">Review requests from your manager before they become active tasks.</div></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Task</th><th>Sales Org</th><th>Due</th><th>Estimated</th><th>Manager</th><th>Action</th></tr></thead><tbody>
+          ${pendingRequests.map(t=>`<tr>
+            <td><strong>${escHtml(t.name)}</strong><div style="font-size:11px;color:var(--text3)">${escHtml(t.description||'')}</div></td>
+            <td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td>
+            <td>${t.dueDate||'—'}</td><td>${t.estHours||0}h</td><td>${escHtml(taskManagerName(t)||'Manager')}</td>
+            <td><div style="display:flex;gap:6px"><button class="btn btn-primary btn-sm" onclick="respondToAdhoc('${t.id}','Accepted')">Accept</button><button class="btn btn-danger btn-sm" onclick="respondToAdhoc('${t.id}','Rejected')">Reject</button></div></td>
+          </tr>`).join('')}
+        </tbody></table></div>
+      </div>` : ''}
       <div class="card" style="margin-top:20px">
         <div class="card-header"><div class="card-title">My Open Tasks</div>
           <button class="btn btn-primary btn-sm" onclick="navigate('adhoc')">View All Tasks</button>
         </div>
-        ${myTasks.length===0
-          ? '<div class="empty-state"><p>No open tasks assigned to you</p></div>'
-          : '<div class="table-wrap"><table><thead><tr><th>Task</th><th>Category</th><th>Due</th><th>Status</th></tr></thead><tbody>'
-            + myTasks.slice(0,5).map(t=>`<tr>
-                <td><strong>${t.name}</strong></td>
+        ${myTasks.filter(t=>!isTaskPendingAcceptance(t)).length===0
+          ? '<div class="empty-state"><p>No accepted open tasks assigned to you</p></div>'
+          : '<div class="table-wrap"><table><thead><tr><th>Task</th><th>Sales Org</th><th>Category</th><th>Due</th><th>Status</th></tr></thead><tbody>'
+            + myTasks.filter(t=>!isTaskPendingAcceptance(t)).slice(0,5).map(t=>`<tr>
+                <td><strong>${t.name}</strong></td><td><span class="badge badge-teal">${t.salesOrg||'—'}</span></td>
                 <td><span class="badge badge-blue">${t.category||'—'}</span></td>
                 <td>${t.dueDate||'—'}</td>
                 <td><span class="badge ${t.status==='In Progress'?'badge-amber':t.status==='Not Started'?'badge-gray':'badge-green'}">${t.status}</span></td>
@@ -765,7 +827,7 @@ function dashboard() {
 
   content.innerHTML = `
     <div class="kpi-grid">
-      ${kpiCard('Total Employees', totalEmps, 'Active team members', '#4F46E5', '#EEF2FF', svgPeople())}
+      ${kpiCard('Total Employees', totalEmps, 'Active team members', '#0B4EA2', '#EEF2FF', svgPeople())}
       ${kpiCard('Regular Reports', totalReg, 'Recurring reports', '#0D9488', '#CCFBF1', svgDoc())}
       ${kpiCard('Adhoc Tasks', totalAdhoc, selectedMonthLabel(), '#F59E0B', '#FEF3C7', svgFlash())}
       ${kpiCard('Due Today', dueToday, 'Pending completion', '#EF4444', '#FEE2E2', svgClock())}
@@ -773,6 +835,8 @@ function dashboard() {
       ${kpiCard('Team Utilization', avgUtil+'%', 'Today', '#0EA5E9', '#E0F2FE', svgChart())}
       ${kpiCard('Available Hrs', totalAvail.toFixed(1)+'h', 'Team today', '#22C55E', '#DCFCE7', svgBattery())}
     </div>
+
+    ${!isMember() ? (()=>{ const teamIds = visibleEmployees().map(e=>e.id); const pending = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && isTaskPendingAcceptance(t)); const responded = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && ['Accepted','Rejected'].includes(taskAssignmentLabel(t)) && t.responseAt).sort((a,b)=>new Date(b.responseAt)-new Date(a.responseAt)).slice(0,8); return `<div class="card" style="margin-bottom:20px;border:1px solid #E5E7EB"><div class="card-header"><div><div class="card-title">Ad Hoc Assignment Control</div><div style="font-size:12px;color:var(--text3);margin-top:3px">Track assignment requests and employee responses in one place.</div></div>${pending.length ? `<span class="badge badge-amber">${pending.length} Pending</span>` : '<span class="badge badge-green">No Pending Requests</span>'}</div>${pending.length ? `<div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Due</th><th>Response</th></tr></thead><tbody>${pending.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${t.dueDate||'—'}</td><td>${assignmentBadge(taskAssignmentLabel(t))}</td></tr>`}).join('')}</tbody></table></div>` : ''}${responded.length ? `<div style="padding:12px 16px 6px;font-size:12px;font-weight:700;color:var(--text2)">Recent Employee Responses</div><div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Response</th><th>When</th></tr></thead><tbody>${responded.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${assignmentBadge(taskAssignmentLabel(t))}${t.acceptedHours?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${t.acceptedHours}h · ${t.startDate||'—'} → ${t.expectedEndDate||'—'}</div>`:''}${t.responseComment?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${escHtml(t.responseComment)}</div>`:''}</td><td>${t.responseAt ? new Date(t.responseAt).toLocaleString() : '—'}</td></tr>`}).join('')}</tbody></table></div>` : ''}</div>`; })() : ''}
 
     <div class="charts-grid">
       <div class="card">
@@ -889,7 +953,7 @@ function buildWorkloadChart(emps, dateStr) {
   STATE.charts['workload'] = new Chart(ctx, {
     type:'doughnut',
     data:{labels:Object.keys(buckets),datasets:[{data:Object.values(buckets),
-      backgroundColor:['#22C55E','#4F46E5','#F59E0B','#EF4444'],borderWidth:0,hoverOffset:6}]},
+      backgroundColor:['#22C55E','#0B4EA2','#F59E0B','#EF4444'],borderWidth:0,hoverOffset:6}]},
     options:{responsive:true,maintainAspectRatio:false,cutout:'65%',
       plugins:{legend:{position:'right',labels:{font:{size:11},boxWidth:12}}}}
   });
@@ -907,7 +971,7 @@ function buildSplitChart(emps, y, m) {
     type:'pie',
     data:{labels:['Regular Reports','Adhoc Tasks'],
       datasets:[{data:[regAssigned,adhocCount],
-        backgroundColor:['#4F46E5','#F59E0B'],borderWidth:0}]},
+        backgroundColor:['#0B4EA2','#F59E0B'],borderWidth:0}]},
     options:{responsive:true,maintainAspectRatio:false,
       plugins:{legend:{position:'bottom',labels:{font:{size:11},boxWidth:12}}}}
   });
@@ -922,7 +986,7 @@ function buildLeaveChart(emps, y, m) {
   STATE.charts['leave'] = new Chart(ctx, {
     type:'bar',
     data:{labels:empNames,datasets:[
-      {label:'Planned',data:planned,backgroundColor:'#4F46E5',borderRadius:4},
+      {label:'Planned',data:planned,backgroundColor:'#0B4EA2',borderRadius:4},
       {label:'Unplanned',data:unplanned,backgroundColor:'#EF4444',borderRadius:4}
     ]},
     options:{responsive:true,maintainAspectRatio:false,
@@ -1093,7 +1157,7 @@ function renderEmpTable() {
       <th>Manager</th><th>Skills</th><th>Daily Hrs</th><th>Role</th><th>Status</th><th>Actions</th>
     </tr></thead>
     <tbody>
-      ${emps.length===0 ? `<tr><td colspan="10"><div class="empty-state">
+      ${emps.length===0 ? `<tr><td colspan="12"><div class="empty-state">
         <p>No employees found</p><small>Try a different search or add a new employee</small>
       </div></td></tr>` :
         emps.map(e=>{
@@ -1516,7 +1580,7 @@ function leaves() {
   const content = document.getElementById('content');
   content.innerHTML = `
     <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
-      ${kpiCard('Planned Leaves', planned.length, selectedMonthLabel(), '#4F46E5','#EEF2FF', svgDoc())}
+      ${kpiCard('Planned Leaves', planned.length, selectedMonthLabel(), '#0B4EA2','#EEF2FF', svgDoc())}
       ${kpiCard('Unplanned Leaves', unplanned.length, selectedMonthLabel(), '#EF4444','#FEE2E2', svgFlash())}
       ${kpiCard('Future Planned', future.length, 'Upcoming', '#22C55E','#DCFCE7', svgClock())}
     </div>
@@ -1761,9 +1825,9 @@ function adhoc() {
           <input type="checkbox" id="f-show-completed" ${STATE.showCompletedAdhoc?'checked':''} onchange="toggleShowCompletedAdhoc()"/>
           Show Completed (${completedCount})
         </label>` : ''}
-        <button class="btn btn-primary" onclick="openAdhocModal()">
+        <button class="btn btn-primary" onclick="${isMember() ? "navigate(\'adhoc\')" : "openAdhocModal()"}">
           <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          ${isMember() ? 'Add Task for Myself' : 'Create Task'}
+          ${isMember() ? 'My Tasks' : 'Create Ad Hoc Task'}
         </button>
       </div>
     </div>
@@ -1775,27 +1839,30 @@ function adhoc() {
     <div class="card">
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Task</th><th>Requestor</th><th>Category</th><th>Assigned To</th>
-          <th>Est Hours</th><th>Due Date</th><th>Status</th><th>Criticality</th><th>Survey</th><th>Actions</th>
+          <th>Task</th><th>Sales Org</th><th>Requestor</th><th>Category</th><th>Assigned To</th>
+          <th>Est Hours</th><th>Due Date</th><th>Assignment</th><th>Status</th><th>Criticality</th><th>Survey</th><th>Actions</th>
         </tr></thead>
         <tbody>
-          ${visibleTasks.length===0 ? `<tr><td colspan="10"><div class="empty-state"><p>${monthTasks.length===0 ? `No adhoc tasks in ${selectedMonthLabel()}` : 'No active tasks — all tasks this month are Completed'}</p></div></td></tr>` :
+          ${visibleTasks.length===0 ? `<tr><td colspan="12"><div class="empty-state"><p>${monthTasks.length===0 ? `No adhoc tasks in ${selectedMonthLabel()}` : 'No active tasks — all tasks this month are Completed'}</p></div></td></tr>` :
             visibleTasks.map(t=>{
               const emp = STATE.employees.find(e=>e.id===t.assignedTo);
               const survey = STATE.surveyResponses.find(r=>r.taskId===t.id);
               return `<tr>
                 <td><div><strong>${t.name}</strong><div style="font-size:11px;color:var(--text3)">ID: ${t.taskId||t.id.slice(0,8)}</div></div></td>
+                <td><span class="badge badge-teal">${t.salesOrg||'—'}</span></td>
                 <td>${t.requestor||'—'}</td>
-                <td><span class="badge badge-teal">${t.category||'—'}</span></td>
+                <td><span class="badge badge-blue">${t.category||'—'}</span></td>
                 <td>${emp ? `<div style="display:flex;align-items:center;gap:6px"><div class="avatar" style="width:24px;height:24px;font-size:9px">${initials(emp.name)}</div>${emp.name}</div>` : '<span style="color:var(--text3)">Unassigned</span>'}</td>
-                <td style="font-weight:600">${t.estHours}h</td>
-                <td>${t.dueDate||'—'}</td>
+                <td style="font-weight:600">${t.acceptedHours||t.estHours}h${t.acceptedHours?'<div style="font-size:10px;color:var(--text3)">accepted</div>':''}</td>
+                <td>${t.expectedEndDate||t.dueDate||'—'}</td>
+                <td>${assignmentBadge(taskAssignmentLabel(t))}</td>
                 <td><span class="badge ${statusBadge(t.status)}">${t.status}</span></td>
                 <td><span class="badge ${critBadge(t.criticality)}">${t.criticality||'—'}</span></td>
                 <td>${t.status!=='Completed' ? '<span style="color:var(--text3)">—</span>' : survey ? `<span class="survey-score-pill">★ ${survey.score}/100</span>` : '<span class="badge badge-amber">Pending</span>'}</td>
                 <td><div style="display:flex;gap:6px;flex-wrap:wrap">
-                  <button class="btn btn-secondary btn-sm" onclick="openAdhocModal('${t.id}')">Edit</button>
-                  <button class="btn btn-teal btn-sm" onclick="updateTaskStatus('${t.id}')">Status</button>
+                  ${isMember() && isTaskPendingAcceptance(t) ? `<button class="btn btn-primary btn-sm" onclick="respondToAdhoc('${t.id}','Accepted')">Accept</button><button class="btn btn-danger btn-sm" onclick="respondToAdhoc('${t.id}','Rejected')">Reject</button>` : ''}
+                  ${!isMember() ? `<button class="btn btn-secondary btn-sm" onclick="openAdhocModal('${t.id}')">Edit</button>` : ''}
+                  ${!isTaskPendingAcceptance(t) && t.assignmentStatus !== 'Rejected' ? `<button class="btn btn-teal btn-sm" onclick="updateTaskStatus('${t.id}')">Status</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-secondary btn-sm" onclick="sendSurveyEmailToOutlook('${t.id}')" title="Open a new Outlook email to the requestor with the click-to-reply survey copied to your clipboard">✉ Email</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-secondary btn-sm" onclick="copySurveyToClipboard('${t.id}')" title="Re-copy the survey if it didn't paste in last time">⧉ Copy Survey</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-primary btn-sm" onclick="openSurveyModal('${t.id}')">${survey ? '★ Update' : '★ Record'}</button>` : ''}
@@ -1815,7 +1882,7 @@ function toggleShowCompletedAdhoc() {
 }
 
 function statusBadge(s) {
-  const map = {'Not Started':'badge-gray','In Progress':'badge-blue','Completed':'badge-green','Delayed':'badge-red','Cancelled':'badge-gray'};
+  const map = {'Awaiting Acceptance':'badge-amber','Not Started':'badge-gray','In Progress':'badge-blue','Completed':'badge-green','Delayed':'badge-red','Cancelled':'badge-gray'};
   return map[s]||'badge-gray';
 }
 function critBadge(c) {
@@ -1835,6 +1902,7 @@ function onAssignedDateChange() {
 }
 
 function openAdhocModal(id) {
+  if(isMember() && !id) { toast('Ad hoc tasks are assigned by your manager','info'); return; }
   const task = id ? STATE.adhocTasks.find(t=>t.id===id) : null;
   const cats = ['Data Pull','Analysis Request','Executive Request','Automation Enhancement','Project Work'];
   const statuses = ['Not Started','In Progress','Completed','Delayed','Cancelled'];
@@ -1850,7 +1918,14 @@ function openAdhocModal(id) {
           <input class="form-control" id="f-tname" placeholder="Q3 Revenue Analysis" value="${escHtml(task?.name||'')}"/>
         </div>
       </div>
-      <div class="form-grid form-grid-2">
+      <div class="form-grid form-grid-3">
+        <div class="form-group">
+          <label class="form-label">Sales Organization *</label>
+          <select class="form-control" id="f-tsalesorg">
+            <option value="">— Select Sales Organization —</option>
+            ${SALES_ORGS.map(o=>`<option value="${o}" ${task?.salesOrg===o?'selected':''}>${o}</option>`).join('')}
+          </select>
+        </div>
         <div class="form-group">
           <label class="form-label">Requestor</label>
           <input class="form-control" id="f-treq" placeholder="Business Owner" value="${escHtml(task?.requestor||'')}"/>
@@ -1894,7 +1969,7 @@ function openAdhocModal(id) {
           </select>
         </div>
         <div class="form-group">
-          <label class="form-label">Assign To</label>
+          <label class="form-label">Assign To *</label>
           ${isMember()
             ? `<input class="form-control" value="${STATE.employees.find(e=>e.id===myEmpId())?.name||''}" readonly style="background:var(--surface2);color:var(--text2)"/>
                <input type="hidden" id="f-tassign" value="${myEmpId()}"/>`
@@ -2045,6 +2120,7 @@ function saveAdhoc(id) {
   const fields = {
     taskId:         document.getElementById('f-tid').value.trim(),
     name:           document.getElementById('f-tname').value.trim(),
+    salesOrg:       document.getElementById('f-tsalesorg').value,
     requestor:      document.getElementById('f-treq').value.trim(),
     requestorEmail: document.getElementById('f-tremail').value.trim(),
     category:       document.getElementById('f-tcat').value,
@@ -2054,12 +2130,17 @@ function saveAdhoc(id) {
     dueDate:        document.getElementById('f-tdue').value,
     status:         document.getElementById('f-tstat').value,
     assignedTo:     isMember() ? myEmpId() : document.getElementById('f-tassign').value,
+    assignmentStatus: isMember() ? 'Accepted' : (id ? (STATE.adhocTasks.find(t=>t.id===id)?.assignmentStatus || 'Accepted') : 'Pending Acceptance'),
+    assignedById:   isMember() ? (STATE.adhocTasks.find(t=>t.id===id)?.assignedById||'') : myEmpId(),
+    assignedByName: isMember() ? (STATE.adhocTasks.find(t=>t.id===id)?.assignedByName||'') : (STATE.currentUser?.name||''),
     criticality:    document.getElementById('f-tcat').value,
     requiredSkills: reqSkillsEl ? JSON.parse(reqSkillsEl.value||'[]') : [],
     year:           STATE.currentYear,
     month:          STATE.currentMonth
   };
   if(!fields.name) { toast('Task name required','error'); return; }
+  if(!fields.salesOrg) { toast('Sales Organization is required','error'); return; }
+  if(!fields.assignedTo) { toast('Please assign the task to an employee','error'); return; }
   const todayStr = today();
   if(fields.assignedDate && fields.assignedDate < todayStr) {
     toast('Assigned date cannot be in the past', 'error');
@@ -2080,7 +2161,7 @@ function saveAdhoc(id) {
     }
     toast('Task updated','success');
   } else {
-    const newTask = {...fields, id:uid(), createdAt:today()};
+    const newTask = {...fields, id:uid(), createdAt:today(), status: isMember() ? fields.status : 'Awaiting Acceptance', assignmentStatus: isMember() ? 'Accepted' : 'Pending Acceptance', responseAt:null, responseComment:''};
     STATE.adhocTasks.push(newTask);
     if(newTask.status === 'Completed') justCompletedId = newTask.id;
     toast('Task created','success');
@@ -2091,9 +2172,217 @@ function saveAdhoc(id) {
   }
 }
 
+function respondToAdhoc(id, decision) {
+  const idx = STATE.adhocTasks.findIndex(t=>t.id===id);
+  if(idx < 0) return;
+  const task = STATE.adhocTasks[idx];
+  if(task.assignedTo !== myEmpId() || !isMember()) { toast('Only the assigned employee can respond to this request','error'); return; }
+  if(!isTaskPendingAcceptance(task)) { toast('This assignment has already been responded to','info'); return; }
+
+  if(decision === 'Rejected') {
+    const comment = prompt('Optional reason for rejecting this task:','');
+    if(comment === null) return;
+    task.assignmentStatus = 'Rejected';
+    task.responseAt = new Date().toISOString();
+    task.responseComment = comment || '';
+    task.status = 'Rejected';
+    save();
+    toast('Task rejected — your manager has been updated','info');
+    dashboard();
+    return;
+  }
+
+  // Acceptance requires the employee to commit to the expected effort and dates.
+  openModal('Accept Ad Hoc Task', `
+    <div style="margin-bottom:14px;padding:12px;border-radius:8px;background:var(--surface2);font-size:12px;color:var(--text2)">
+      <strong>${escHtml(task.name)}</strong><br/>
+      ${escHtml(task.salesOrg||'')} · Manager estimate: ${task.estHours||0}h
+    </div>
+    <div class="form-grid form-grid-3">
+      <div class="form-group">
+        <label class="form-label">Expected Hours *</label>
+        <input class="form-control" id="f-accept-hours" type="number" min="0.5" step="0.5" value="${task.acceptedHours||task.estHours||2}"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Start Date *</label>
+        <input class="form-control" id="f-accept-start" type="date" min="${today()}" value="${task.startDate||task.assignedDate||today()}"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Expected End Date *</label>
+        <input class="form-control" id="f-accept-end" type="date" min="${task.startDate||task.assignedDate||today()}" value="${task.expectedEndDate||task.dueDate||task.startDate||task.assignedDate||today()}"/>
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:12px">
+      <label class="form-label">Note to Manager <span style="color:var(--text3);font-weight:400">(optional)</span></label>
+      <textarea class="form-control" id="f-accept-comment" placeholder="Add any context about your planned completion…">${escHtml(task.responseComment||'')}</textarea>
+    </div>
+  `, [
+    {label:'Cancel', cls:'btn-secondary', fn:'closeModal()'},
+    {label:'Accept & Start Task', cls:'btn-primary', fn:`confirmAdhocAcceptance('${id}')`}
+  ]);
+}
+
+async function confirmAdhocAcceptance(id) {
+  const idx = STATE.adhocTasks.findIndex(t=>t.id===id);
+  if(idx < 0) return;
+  const task = STATE.adhocTasks[idx];
+  if(task.assignedTo !== myEmpId() || !isMember()) { toast('Only the assigned employee can accept this request','error'); return; }
+  if(!isTaskPendingAcceptance(task)) { toast('This assignment has already been responded to','info'); closeModal(); return; }
+
+  const hours = parseFloat(document.getElementById('f-accept-hours')?.value)||0;
+  const startDate = document.getElementById('f-accept-start')?.value||'';
+  const endDate = document.getElementById('f-accept-end')?.value||'';
+  const comment = document.getElementById('f-accept-comment')?.value.trim()||'';
+  const todayStr = today();
+
+  if(hours <= 0) { toast('Expected hours must be greater than 0','error'); return; }
+  if(!startDate || !endDate) { toast('Start date and expected end date are required','error'); return; }
+  if(startDate < todayStr) { toast('Start date cannot be in the past','error'); return; }
+  if(endDate < startDate) { toast('Expected end date cannot be before the start date','error'); return; }
+
+  task.assignmentStatus = 'Accepted';
+  task.responseAt = new Date().toISOString();
+  task.responseComment = comment;
+  task.acceptedHours = hours;
+  task.startDate = startDate;
+  task.expectedEndDate = endDate;
+  task.status = 'In Progress';
+
+  // Wait for the acceptance to actually be persisted BEFORE doing anything
+  // navigation-risky (the mailto: below). Firing that navigation while the
+  // Supabase write is still in flight risks interrupting it in some
+  // browsers, so the status change never lands in the database even though
+  // it briefly looked accepted on screen.
+  await save();
+
+  closeModal();
+  toast('Task accepted and moved to In Progress — your manager has been updated','success');
+  notifyRequestorOfAcceptance(task);
+  dashboard();
+}
+
+// ═══════════════════════════════════════════════════════════
+// IN-APP NOTIFICATIONS — lightweight activity log, shared via
+// Supabase like everything else in STATE, so any signed-in user
+// (not just the tab that triggered it) sees the same history.
+// ═══════════════════════════════════════════════════════════
+function addNotification({ type, title, message, taskId }) {
+  STATE.notifications.unshift({
+    id: uid(),
+    type,
+    title,
+    message,
+    taskId: taskId || null,
+    read: false,
+    createdAt: new Date().toISOString()
+  });
+  // Cap so this collection doesn't grow unbounded — this is an activity
+  // feed, not a permanent audit log.
+  if(STATE.notifications.length > 200) STATE.notifications.length = 200;
+  save();
+  updateNotificationBadge();
+}
+
+function updateNotificationBadge() {
+  const el = document.getElementById('notif-badge');
+  if(!el) return;
+  const unread = STATE.notifications.filter(n=>!n.read).length;
+  if(unread > 0) {
+    el.textContent = unread > 99 ? '99+' : String(unread);
+    el.style.display = 'flex';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function notificationTimeAgo(iso) {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.round(diffMs/60000);
+  if(mins < 1) return 'just now';
+  if(mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins/60);
+  if(hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs/24)}d ago`;
+}
+
+function openNotificationsPanel() {
+  const items = STATE.notifications.slice(0,50);
+  const body = items.length ? `
+    <div style="display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto">
+      ${items.map(n => `
+        <div style="padding:10px 12px;border-radius:8px;background:${n.read?'var(--surface2)':'#EEF2FF'};border:1px solid ${n.read?'var(--border)':'#C7D2FE'}">
+          <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
+            <strong style="font-size:13px">${escHtml(n.title)}</strong>
+            <span style="font-size:11px;color:var(--text3);white-space:nowrap">${notificationTimeAgo(n.createdAt)}</span>
+          </div>
+          <div style="font-size:12px;color:var(--text2);margin-top:3px">${escHtml(n.message)}</div>
+        </div>
+      `).join('')}
+    </div>
+  ` : `<div class="empty-state"><p>No notifications yet</p></div>`;
+
+  openModal('Notifications', body, [
+    {label:'Close', cls:'btn-secondary', fn:'closeModal()'},
+    {label:'Mark all read', cls:'btn-primary', fn:'markAllNotificationsRead()'}
+  ]);
+  // Opening the panel is treated as "seen" — clear the unread badge but
+  // leave items visually distinct (still tinted above) until explicitly
+  // marked read, so nothing is lost if the user just glances and closes.
+  markAllNotificationsRead({ silent:true });
+}
+
+function markAllNotificationsRead(opts) {
+  const silent = opts && opts.silent;
+  STATE.notifications.forEach(n=>{ n.read = true; });
+  save();
+  updateNotificationBadge();
+  if(!silent) { toast('All notifications marked read','success'); closeModal(); }
+}
+
+// Emails the requestor (task.requestorEmail, entered at task creation) the
+// moment an employee accepts the assignment, and logs the outcome to the
+// in-app notification feed above — the requestor themselves isn't a
+// PWMS user, so the feed is the confirmation trail for managers/admins
+// that the requestor was (or wasn't) actually informed.
+function notifyRequestorOfAcceptance(task) {
+  const emp = STATE.employees.find(e=>e.id===task.assignedTo);
+  const empName = emp?.name || 'The assigned employee';
+  const taskRef = `${task.name} [${task.taskId || task.id.slice(0,8)}]`;
+
+  if(!task.requestorEmail) {
+    addNotification({
+      type: 'requestor_email_skipped',
+      title: 'Requestor not emailed',
+      message: `${empName} accepted "${taskRef}", but no requestor email is on file for this task — add one to notify them automatically next time.`,
+      taskId: task.id
+    });
+    return;
+  }
+
+  const subject = `Your request has been accepted: ${task.name}`;
+  const body = `Hi ${task.requestor || 'there'},\n\n`
+    + `Good news — your request "${task.name}" has been accepted by ${empName} and is now in progress.\n\n`
+    + `Expected effort: ${task.acceptedHours}h\n`
+    + `Start date: ${task.startDate}\n`
+    + `Expected completion: ${task.expectedEndDate}\n`
+    + (task.responseComment ? `\nNote from ${empName}: ${task.responseComment}\n` : '')
+    + `\nWe'll follow up once the work is complete.`;
+  const mailtoLink = `mailto:${task.requestorEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  window.location.href = mailtoLink;
+
+  addNotification({
+    type: 'requestor_email_sent',
+    title: 'Requestor notified',
+    message: `${empName} accepted "${taskRef}" — an email to ${task.requestorEmail} was opened in Outlook.`,
+    taskId: task.id
+  });
+}
+
 function updateTaskStatus(id) {
   const task = STATE.adhocTasks.find(t=>t.id===id);
   if(!task) return;
+  if(isTaskPendingAcceptance(task)) { toast('This task is awaiting employee acceptance','info'); return; }
+  if(taskAssignmentLabel(task)==='Rejected') { toast('Rejected assignments cannot be updated','info'); return; }
   const statuses = ['Not Started','In Progress','Completed','Delayed','Cancelled'];
   openModal('Update Task Status', `
     <div class="form-group">
@@ -2127,6 +2416,7 @@ function updateTaskStatus(id) {
 
 function saveTaskStatus(id) {
   const idx=STATE.adhocTasks.findIndex(t=>t.id===id);
+  if(idx>-1 && taskAssignmentLabel(STATE.adhocTasks[idx]) !== 'Accepted') { toast('Task must be accepted before status can be updated','error'); return; }
   if(idx>-1) {
     const wasCompleted = STATE.adhocTasks[idx].status === 'Completed';
     STATE.adhocTasks[idx].status = document.getElementById('f-ustat').value;
@@ -2168,7 +2458,7 @@ function buildAnswerMailto(task, qLabel, answer) {
 
 function buildSurveyEmailHtml(task) {
   const satLinks = [1,2,3,4,5].map(n=>
-    `<td align="center" bgcolor="#4F46E5" style="border-radius:6px;padding:0;"><a href="${buildAnswerMailto(task,'Satisfaction',n)}" style="display:block;width:36px;padding:10px 0;color:#ffffff;text-decoration:none;font-family:Arial,sans-serif;font-weight:bold;font-size:15px;">${n}</a></td><td width="8"></td>`
+    `<td align="center" bgcolor="#0B4EA2" style="border-radius:6px;padding:0;"><a href="${buildAnswerMailto(task,'Satisfaction',n)}" style="display:block;width:36px;padding:10px 0;color:#ffffff;text-decoration:none;font-family:Arial,sans-serif;font-weight:bold;font-size:15px;">${n}</a></td><td width="8"></td>`
   ).join('');
   const timeLinks = ['Yes','No'].map(v=>
     `<td align="center" bgcolor="${v==='Yes'?'#22C55E':'#EF4444'}" style="border-radius:6px;padding:0;"><a href="${buildAnswerMailto(task,'On-Time Delivery',v)}" style="display:block;padding:10px 22px;color:#ffffff;text-decoration:none;font-family:Arial,sans-serif;font-weight:bold;font-size:15px;">${v}</a></td><td width="8"></td>`
@@ -2196,7 +2486,7 @@ function buildSurveyEmailHtml(task) {
     <table role="presentation" cellpadding="0" cellspacing="0"><tr>${qualLinks}</tr></table>
     <p style="font-family:Arial,sans-serif;font-size:11px;color:#9CA3AF;margin:6px 0 0;">1 = Poor &nbsp;·&nbsp; 5 = Excellent</p>
   </td></tr>
-  <tr><td style="padding:22px 24px 24px;"><p style="font-family:Arial,sans-serif;font-size:13px;color:#374151;margin:0;">Have a suggestion for next time? <a href="${commentMailto}" style="color:#4F46E5;">Click here to send a quick comment</a>.</p></td></tr>
+  <tr><td style="padding:22px 24px 24px;"><p style="font-family:Arial,sans-serif;font-size:13px;color:#374151;margin:0;">Have a suggestion for next time? <a href="${commentMailto}" style="color:#0B4EA2;">Click here to send a quick comment</a>.</p></td></tr>
   <tr><td style="background:#F9FAFB;padding:14px 24px;border-top:1px solid #E5E7EB;"><p style="font-family:Arial,sans-serif;font-size:11px;color:#9CA3AF;margin:0;">Thanks for helping us improve our ad-hoc request support!</p></td></tr>
 </table>`;
 }
@@ -2794,7 +3084,7 @@ function performance() {
           </div>
 
           <div style="font-size:12px;color:var(--text3);margin-bottom:8px">Score Breakdown</div>
-          ${scoreBar('Regular Reports (30%)', 100, 30, '#4F46E5')}
+          ${scoreBar('Regular Reports (30%)', 100, 30, '#0B4EA2')}
           ${scoreBar('Adhoc Tasks (20%)', myAdhoc.length?Math.round(adhocDone/myAdhoc.length*100):100, 20, '#0D9488')}
           ${scoreBar('Quality & Requestor Survey (35%)', qs, 35, '#F59E0B')}
           ${scoreBar('Utilization (10%)', bw.pct, 10, '#0EA5E9')}
@@ -2878,7 +3168,7 @@ function skills() {
     </div>
 
     <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
-      ${kpiCard('Total Skills', STATE.skills.length, 'In library', '#4F46E5','#EEF2FF', svgStar())}
+      ${kpiCard('Total Skills', STATE.skills.length, 'In library', '#0B4EA2','#EEF2FF', svgStar())}
       ${kpiCard('Categories', cats.length||0, 'Skill groups', '#0D9488','#CCFBF1', svgChart())}
       ${kpiCard('Employees with Skills', STATE.employees.filter(e=>e.skills&&e.skills.length>0&&e.status==='active').length, 'Active', '#F59E0B','#FEF3C7', svgPeople())}
     </div>
@@ -3030,7 +3320,7 @@ function teams() {
     </div>
 
     <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
-      ${kpiCard('Total Teams', STATE.teams.length, 'Defined', '#4F46E5','#EEF2FF', svgChart())}
+      ${kpiCard('Total Teams', STATE.teams.length, 'Defined', '#0B4EA2','#EEF2FF', svgChart())}
       ${kpiCard('Managers', [...new Set(STATE.teams.map(t=>t.manager).filter(Boolean))].length, 'Unique', '#0D9488','#CCFBF1', svgPeople())}
       ${kpiCard('Unassigned Employees', STATE.employees.filter(e=>e.status==='active'&&!e.team).length, 'Active, no team', '#F59E0B','#FEF3C7', svgPeople())}
     </div>
@@ -3247,7 +3537,7 @@ const PM_TASK_STATUSES = ['Backlog','Planned','In Progress','Review','Blocked','
 const PM_PRIORITIES = ['Low','Medium','High','Urgent'];
 const PM_HEALTHS = ['On Track','At Risk','Delayed'];
 const PM_PROJECT_STATUSES = ['Active','On Hold','Completed','Archived'];
-const PM_PROJECT_COLORS = ['#4F46E5','#0D9488','#F59E0B','#EF4444','#22C55E','#8B5CF6','#EC4899','#3B82F6'];
+const PM_PROJECT_COLORS = ['#0B4EA2','#0D9488','#F59E0B','#EF4444','#22C55E','#8B5CF6','#EC4899','#3B82F6'];
 const PM_DEPARTMENTS = ['Analytics','Engineering','Operations','Marketing','Finance','Customer Success'];
 const PM_BOARD_COLS = [
   {key:'name', label:'Project Name'}, {key:'ownerId', label:'Owner'}, {key:'status', label:'Status'},
@@ -3264,7 +3554,7 @@ function pmProjectTasks(pid) { return STATE.pmTasks.filter(t => t.projectId === 
 function pmEmpName(id) { const e = STATE.employees.find(x => x.id === id); return e ? e.name : null; }
 function pmOwnerName(id) { return pmEmpName(id) || 'Unassigned'; }
 function formatCurrency(n) { return '$' + Math.round(n || 0).toLocaleString(); }
-function pmStatusColor(s) { return {Backlog:'#9CA3AF',Planned:'#9CA3AF','In Progress':'#4F46E5',Review:'#F59E0B',Blocked:'#EF4444',Completed:'#22C55E'}[s] || '#9CA3AF'; }
+function pmStatusColor(s) { return {Backlog:'#9CA3AF',Planned:'#9CA3AF','In Progress':'#0B4EA2',Review:'#F59E0B',Blocked:'#EF4444',Completed:'#22C55E'}[s] || '#9CA3AF'; }
 
 function pmProjectProgress(p) {
   const tasks = pmProjectTasks(p.id);
@@ -3407,7 +3697,7 @@ function pmBuildPriorityChart(projs) {
   projs.forEach(p=>{ (byPri[p.priority]=byPri[p.priority]||[]).push(p.progress||0); });
   const labels = PM_PRIORITIES;
   const data = labels.map(l=>{ const arr=byPri[l]||[]; return arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length) : 0; });
-  STATE.charts.pmPriority = new Chart(ctx, { type:'bar', data:{ labels, datasets:[{ label:'Avg Progress %', data, backgroundColor:'#4F46E5', borderRadius:6 }] }, options:{ scales:{ y:{ beginAtZero:true, max:100 } }, plugins:{ legend:{ display:false } } } });
+  STATE.charts.pmPriority = new Chart(ctx, { type:'bar', data:{ labels, datasets:[{ label:'Avg Progress %', data, backgroundColor:'#0B4EA2', borderRadius:6 }] }, options:{ scales:{ y:{ beginAtZero:true, max:100 } }, plugins:{ legend:{ display:false } } } });
 }
 
 // ── BOARD VIEW (spreadsheet-style) ───────────────────────
@@ -3586,7 +3876,7 @@ function pmProjectDetail() {
     <div class="pm-back-link" onclick="backToProjects()">&larr; Back to Projects</div>
     <div class="pm-detail-head">
       <div style="display:flex;align-items:center;gap:16px">
-        <div class="pm-ring-wrap">${pmRingSvg(p.progress||0, p.color||'#4F46E5')}<div class="pm-ring-label">${p.progress||0}%</div></div>
+        <div class="pm-ring-wrap">${pmRingSvg(p.progress||0, p.color||'#0B4EA2')}<div class="pm-ring-label">${p.progress||0}%</div></div>
         <div>
           <h2 style="margin-bottom:4px">${p.name}</h2>
           <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -3952,7 +4242,7 @@ function exportCSV() {
   const blob = new Blob([csv],{type:'text/csv'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `workpulse_${monthName(m)}_${y}.csv`;
+  a.download = `pwms_${monthName(m)}_${y}.csv`;
   a.click();
   toast('CSV exported','success');
 }
@@ -4031,7 +4321,7 @@ function seedData() {
 
   // Sample projects + tasks for the Projects module
   const addDays = (n) => fmtDate(new Date(Date.now() + n*86400000));
-  const proj1 = {id:uid(), name:'Q4 Analytics Revamp', description:'Modernize the analytics stack and refresh core dashboards for Q4 stakeholders.', ownerId:emps[0].id, status:'Active', health:'On Track', budget:45000, startDate:addDays(-10), targetDate:addDays(20), actualEndDate:null, progress:0, priority:'High', department:'Analytics', color:'#4F46E5', tags:['dashboards','q4'], risks:[{text:'Vendor API may deprecate before rollout', severity:'Medium', resolved:false, createdAt:today()}], dependencies:['Data warehouse migration'], createdAt:today(), updatedAt:today()};
+  const proj1 = {id:uid(), name:'Q4 Analytics Revamp', description:'Modernize the analytics stack and refresh core dashboards for Q4 stakeholders.', ownerId:emps[0].id, status:'Active', health:'On Track', budget:45000, startDate:addDays(-10), targetDate:addDays(20), actualEndDate:null, progress:0, priority:'High', department:'Analytics', color:'#0B4EA2', tags:['dashboards','q4'], risks:[{text:'Vendor API may deprecate before rollout', severity:'Medium', resolved:false, createdAt:today()}], dependencies:['Data warehouse migration'], createdAt:today(), updatedAt:today()};
   const proj2 = {id:uid(), name:'Client Onboarding Portal', description:'Self-serve onboarding flow for new logistics accounts.', ownerId:emps[2].id, status:'On Hold', health:'At Risk', budget:28000, startDate:addDays(-5), targetDate:addDays(35), actualEndDate:null, progress:0, priority:'Medium', department:'Engineering', color:'#0D9488', tags:['portal','onboarding'], risks:[], dependencies:[], createdAt:today(), updatedAt:today()};
   STATE.pmProjects = [proj1, proj2];
 
