@@ -561,7 +561,7 @@ function myEmpId()   { return STATE.currentUser?.empId; }
 function myTeam()    { return STATE.currentUser?.team; }
 
 // Adhoc assignment workflow
-const SALES_ORGS = ['BCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
+const SALES_ORGS = ['PCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
 const ADHOC_ASSIGNMENT_STATUSES = ['Pending Acceptance','Accepted','Rejected'];
 
 function taskAssignmentLabel(t) {
@@ -1886,7 +1886,7 @@ function statusBadge(s) {
   return map[s]||'badge-gray';
 }
 function critBadge(c) {
-  const map = {'Data Pull':'badge-teal','Analysis Request':'badge-blue','Executive Request':'badge-red','Automation Enhancement':'badge-amber','Project Work':'badge-green'};
+  const map = {'Data Pull':'badge-teal','Analysis Request':'badge-blue','Project Work':'badge-green'};
   return map[c]||'badge-gray';
 }
 
