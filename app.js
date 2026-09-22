@@ -67,8 +67,6 @@ const STATE = {
   holidays: [],
   skills: [],        // {id, name, category, description}
   teams: [],         // {id, name, manager}
-  pmProjects: [],    // Project: {id,name,description,ownerId,status,health,budget,startDate,targetDate,actualEndDate,progress,priority,department,tags[],risks[],dependencies[],color,createdAt,updatedAt}
-  pmTasks: [],       // Task: {id,projectId,parentTaskId,title,description,status,priority,assigneeId,reporterId,startDate,dueDate,estimatedHours,actualHours,completionPercent,labels[],dependencies[],blockers[],comments[],attachments[],createdAt,completedAt}
   currentUser: null, // {role:'admin'|'manager'|'member', empId, name}
   currentMonth: new Date().getMonth(),
   currentYear: new Date().getFullYear(),
@@ -77,10 +75,6 @@ const STATE = {
   settings: {
     surveyInboxEmail: 'adhocsupport@yourcompany.com' // shared inbox that receives click-to-reply survey answers — edit in Adhoc Tasks page
   },
-  pmProjectId: null, // UI-only: currently open project in the Projects module, not persisted
-  pmView: 'dashboard', // UI-only: active top-level Projects view — dashboard | board | kanban
-  pmDetailTab: 'overview', // UI-only: active tab within a project's detail page
-  pmBoard: { sortKey:'name', sortDir:'asc', search:'', filterStatus:'', filterHealth:'', groupBy:'none', selected:[] }, // UI-only board view state
   notifications: [], // in-app activity log — {id,type,title,message,taskId,read,createdAt}, newest first, capped at 200
   charts: {}
 };
@@ -110,7 +104,7 @@ const STATE = {
 //   create policy "Authenticated can update" on workpulse_data for update using (auth.role() = 'authenticated');
 //   alter publication supabase_realtime add table workpulse_data;  -- enables realtime for this table
 //
-const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','pmProjects','pmTasks','notifications'];
+const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','notifications'];
 const DATA_TABLE = 'workpulse_data';
 
 let _realtimeChannel = null;
@@ -388,7 +382,6 @@ const PAGE_TITLES = {
   dashboard:'Dashboard', capacity:'Capacity Planner',
   employees:'Employees', leaves:'Leave Management',
   regular:'Regular Reports', adhoc:'Adhoc Tasks',
-  projects:'Projects',
   assignments:'Assignments', quality:'Quality Management',
   performance:'Performance', holidays:'Holiday Calendar',
   skills:'Skills Library',
@@ -414,9 +407,9 @@ const PAGE_TITLES = {
 
 // Pages fully accessible by role
 const PAGE_ACCESS = {
-  admin:   ['dashboard','capacity','employees','leaves','regular','adhoc','projects','assignments','quality','performance','holidays','skills','teams'],
-  manager: ['dashboard','capacity','employees','leaves','regular','adhoc','projects','assignments','quality','performance','holidays','skills','teams'],
-  member:  ['dashboard','adhoc','projects','performance']  // everything else shows locked
+  admin:   ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','quality','performance','holidays','skills','teams'],
+  manager: ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','quality','performance','holidays','skills','teams'],
+  member:  ['dashboard','adhoc','performance']  // everything else shows locked
 };
 
 function showLogin() {
@@ -561,7 +554,7 @@ function myEmpId()   { return STATE.currentUser?.empId; }
 function myTeam()    { return STATE.currentUser?.team; }
 
 // Adhoc assignment workflow
-const SALES_ORGS = ['PCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
+const SALES_ORGS = ['BCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
 const ADHOC_ASSIGNMENT_STATUSES = ['Pending Acceptance','Accepted','Rejected'];
 
 function taskAssignmentLabel(t) {
@@ -606,7 +599,6 @@ function lockedPage(pageName) {
 
 function navigate(page) {
   if(!STATE.currentUser) { showLogin(); return; }
-  if(page==='projects') { STATE.pmProjectId = null; STATE.pmView = 'dashboard'; }
   STATE.currentPage = page;
   document.querySelectorAll('.nav-item').forEach(n=>{
     n.classList.toggle('active', n.dataset.page===page);
@@ -625,7 +617,7 @@ function render() {
 
   const pages = {
     dashboard, capacity, employees, leaves,
-    regular, adhoc, projects, assignments, quality,
+    regular, adhoc, assignments, quality,
     performance, holidays, skills, teams
   };
   const fn = pages[STATE.currentPage];
@@ -1443,16 +1435,11 @@ function deleteEmployee(id) {
   STATE.qualityReviews  = STATE.qualityReviews.filter(r=>r.employeeId!==id);
   STATE.surveyResponses = STATE.surveyResponses.filter(r=>r.employeeId!==id);
 
-  // Work items (adhoc tasks, project tasks/projects) are organizational
-  // records, not the employee's own data — unassign rather than delete, so
-  // the task/project and its history survive and can be handed to someone
-  // else instead of silently disappearing.
+  // Work items (adhoc tasks) are organizational records, not the employee's
+  // own data — unassign rather than delete, so the task and its history
+  // survive and can be handed to someone else instead of silently
+  // disappearing.
   STATE.adhocTasks.forEach(t=>{ if(t.assignedTo===id) t.assignedTo = null; });
-  STATE.pmTasks.forEach(t=>{
-    if(t.assigneeId===id)  t.assigneeId  = null;
-    if(t.reporterId===id)  t.reporterId  = null;
-  });
-  STATE.pmProjects.forEach(p=>{ if(p.ownerId===id) p.ownerId = null; });
 
   save(); toast('Employee and their records deleted','info'); employees();
 }
@@ -1886,7 +1873,7 @@ function statusBadge(s) {
   return map[s]||'badge-gray';
 }
 function critBadge(c) {
-  const map = {'Data Pull':'badge-teal','Analysis Request':'badge-blue','Project Work':'badge-green'};
+  const map = {'Data Pull':'badge-teal','Analysis Request':'badge-blue','Executive Request':'badge-red','Automation Enhancement':'badge-amber'};
   return map[c]||'badge-gray';
 }
 
@@ -1904,7 +1891,7 @@ function onAssignedDateChange() {
 function openAdhocModal(id) {
   if(isMember() && !id) { toast('Ad hoc tasks are assigned by your manager','info'); return; }
   const task = id ? STATE.adhocTasks.find(t=>t.id===id) : null;
-  const cats = ['Data Pull','Analysis Request','Executive Request','Automation Enhancement','Project Work'];
+  const cats = ['Data Pull','Analysis Request','Executive Request','Automation Enhancement'];
   const statuses = ['Not Started','In Progress','Completed','Delayed','Cancelled'];
   openModal(isMember() ? (task?'Edit My Task':'Add Task for Myself') : (task?'Edit Adhoc Task':'Create Adhoc Task'), `
     <div class="form-grid">
@@ -3531,679 +3518,6 @@ function deleteHoliday(id) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// PAGE: PROJECTS — Monday-style Work OS module
-// ═══════════════════════════════════════════════════════════
-const PM_TASK_STATUSES = ['Backlog','Planned','In Progress','Review','Blocked','Completed'];
-const PM_PRIORITIES = ['Low','Medium','High','Urgent'];
-const PM_HEALTHS = ['On Track','At Risk','Delayed'];
-const PM_PROJECT_STATUSES = ['Active','On Hold','Completed','Archived'];
-const PM_PROJECT_COLORS = ['#0B4EA2','#0D9488','#F59E0B','#EF4444','#22C55E','#8B5CF6','#EC4899','#3B82F6'];
-const PM_DEPARTMENTS = ['Analytics','Engineering','Operations','Marketing','Finance','Customer Success'];
-const PM_BOARD_COLS = [
-  {key:'name', label:'Project Name'}, {key:'ownerId', label:'Owner'}, {key:'status', label:'Status'},
-  {key:'priority', label:'Priority'}, {key:'health', label:'Health'}, {key:'progress', label:'Progress'},
-  {key:'timeline', label:'Timeline'}, {key:'department', label:'Department'}, {key:'budget', label:'Budget'},
-  {key:'dependencies', label:'Dependencies'}, {key:'risk', label:'Risk'}, {key:'tags', label:'Tags'},
-  {key:'updatedAt', label:'Last Updated'}
-];
-
-function slug(s) { return (s||'').replace(/\s+/g,''); }
-function canManageProjects() { return isAdmin() || isManager(); }
-function pmTaskCanEdit(task) { return canManageProjects() || (isMember() && task && task.assigneeId === myEmpId()); }
-function pmProjectTasks(pid) { return STATE.pmTasks.filter(t => t.projectId === pid); }
-function pmEmpName(id) { const e = STATE.employees.find(x => x.id === id); return e ? e.name : null; }
-function pmOwnerName(id) { return pmEmpName(id) || 'Unassigned'; }
-function formatCurrency(n) { return '$' + Math.round(n || 0).toLocaleString(); }
-function pmStatusColor(s) { return {Backlog:'#9CA3AF',Planned:'#9CA3AF','In Progress':'#0B4EA2',Review:'#F59E0B',Blocked:'#EF4444',Completed:'#22C55E'}[s] || '#9CA3AF'; }
-
-function pmProjectProgress(p) {
-  const tasks = pmProjectTasks(p.id);
-  if (!tasks.length) return p.progress || 0;
-  const avg = tasks.reduce((s,t) => s + (t.completionPercent || 0), 0) / tasks.length;
-  return Math.round(avg);
-}
-function pmProjectOverdueTasks(p) { return pmProjectTasks(p.id).filter(t => t.dueDate && t.dueDate < today() && t.status !== 'Completed'); }
-
-// Automation rules
-function pmRecalcHealth(p) {
-  if (p.status !== 'Completed' && p.targetDate && p.targetDate < today()) { p.health = 'Delayed'; return; }
-  const overdue = pmProjectOverdueTasks(p).length;
-  if (overdue > 0) { if (p.health !== 'Delayed') p.health = 'At Risk'; return; }
-  if (!p.health || p.health === 'At Risk') p.health = 'On Track';
-}
-function pmRecalcProgress(p) {
-  p.progress = pmProjectProgress(p);
-  if (p.progress >= 100 && p.status !== 'Completed') {
-    p.status = 'Completed'; p.actualEndDate = p.actualEndDate || today(); p.health = 'On Track';
-  }
-}
-function pmSyncProjectFromTasks(pid) {
-  const p = STATE.pmProjects.find(x => x.id === pid); if (!p) return;
-  pmRecalcProgress(p); pmRecalcHealth(p); p.updatedAt = today();
-}
-
-// ── ROUTER ────────────────────────────────────────────────
-function projects() {
-  if (STATE.pmProjectId) { pmProjectDetail(); return; }
-  if (STATE.pmView === 'board') { pmRenderBoard(); }
-  else if (STATE.pmView === 'kanban') { pmRenderKanban(); }
-  else { pmRenderDashboard(); }
-}
-function pmSetView(v) { STATE.pmView = v; STATE.pmProjectId = null; render(); }
-function openProject(id) { STATE.pmProjectId = id; STATE.pmDetailTab = 'overview'; render(); }
-function backToProjects() { STATE.pmProjectId = null; render(); }
-function pmSetDetailTab(t) { STATE.pmDetailTab = t; pmProjectDetail(); }
-
-function pmTopBar(activeView) {
-  return `
-  <div class="pm-toolbar">
-    <div class="pm-toolbar-left">
-      <div class="pm-tabs">
-        <div class="pm-tab ${activeView==='dashboard'?'active':''}" onclick="pmSetView('dashboard')">Portfolio Dashboard</div>
-        <div class="pm-tab ${activeView==='board'?'active':''}" onclick="pmSetView('board')">Board</div>
-        <div class="pm-tab ${activeView==='kanban'?'active':''}" onclick="pmSetView('kanban')">Kanban</div>
-      </div>
-    </div>
-    <div class="pm-toolbar-right">
-      ${canManageProjects() ? `<button class="btn btn-primary btn-sm" onclick="openProjectModal()">+ New Project</button>` : ''}
-    </div>
-  </div>`;
-}
-
-// ── PORTFOLIO DASHBOARD ──────────────────────────────────
-function pmRenderDashboard() {
-  const projs = STATE.pmProjects;
-  projs.forEach(p => { pmRecalcHealth(p); p.progress = pmProjectProgress(p); });
-  const total = projs.length;
-  const onTrack = projs.filter(p=>p.health==='On Track').length;
-  const atRisk = projs.filter(p=>p.health==='At Risk').length;
-  const delayed = projs.filter(p=>p.health==='Delayed').length;
-  const completed = projs.filter(p=>p.status==='Completed').length;
-  const totalBudget = projs.reduce((s,p)=>s+(Number(p.budget)||0),0);
-  const spentEst = projs.reduce((s,p)=>s+((Number(p.budget)||0)*(p.progress/100)),0);
-  const budgetUtil = totalBudget ? Math.round(spentEst/totalBudget*100) : 0;
-  const allTasks = STATE.pmTasks;
-  const overdueTasks = allTasks.filter(t=>t.dueDate && t.dueDate<today() && t.status!=='Completed').length;
-  const openRisks = projs.reduce((s,p)=>s+((p.risks||[]).filter(r=>!r.resolved).length),0);
-  const assignedEmpIds = new Set(allTasks.filter(t=>t.status!=='Completed' && t.assigneeId).map(t=>t.assigneeId));
-  const resourceUtil = STATE.employees.length ? Math.round(assignedEmpIds.size/STATE.employees.length*100) : 0;
-
-  document.getElementById('content').innerHTML = `
-    ${pmTopBar('dashboard')}
-    <div class="kpi-grid">
-      ${kpiCard('Total Projects', total, `${projs.filter(p=>p.status==='Active').length} active`, 'var(--primary)', 'var(--primary-lt)', svgDoc())}
-      ${kpiCard('On Track', onTrack, `${total?Math.round(onTrack/total*100):0}% of portfolio`, 'var(--green)', 'var(--green-lt)', svgFlash())}
-      ${kpiCard('At Risk', atRisk, 'needs attention', '#D97706', 'var(--accent-lt)', svgClock())}
-      ${kpiCard('Delayed', delayed, 'past target date', 'var(--coral)', 'var(--coral-lt)', svgClock())}
-      ${kpiCard('Completed', completed, `${total?Math.round(completed/total*100):0}% of portfolio`, 'var(--teal)', 'var(--teal-lt)', svgStar())}
-      ${kpiCard('Budget Utilization', budgetUtil+'%', formatCurrency(spentEst)+' of '+formatCurrency(totalBudget), 'var(--primary)', 'var(--primary-lt)', svgChart())}
-      ${kpiCard('Resource Utilization', resourceUtil+'%', `${assignedEmpIds.size} of ${STATE.employees.length} staffed`, 'var(--teal)', 'var(--teal-lt)', svgPeople())}
-      ${kpiCard('Open Risks', openRisks, 'across all projects', 'var(--coral)', 'var(--coral-lt)', svgFlash())}
-      ${kpiCard('Overdue Tasks', overdueTasks, 'past due date', 'var(--coral)', 'var(--coral-lt)', svgBattery())}
-    </div>
-    <div class="pm-dash-grid">
-      <div class="pm-panel"><h4>Project Health Distribution</h4><canvas id="pm-ch-health" height="180"></canvas></div>
-      <div class="pm-panel"><h4>Avg Completion by Priority</h4><canvas id="pm-ch-priority" height="180"></canvas></div>
-      <div class="pm-panel"><h4>Department Heatmap</h4>${pmDeptHeatmapHtml(projs)}</div>
-      <div class="pm-panel"><h4>Top Open Risks</h4>${pmTopRisksHtml(projs)}</div>
-    </div>
-    <div class="pm-panel" style="margin-top:16px">
-      <h4>AI Assistant <span style="font-weight:400;color:var(--text3);font-size:11.5px">— placeholders, coming in a future update</span></h4>
-      <div class="pm-ai-grid">
-        ${pmAiCard('Generate Status Report', svgDoc())}
-        ${pmAiCard('Predict Delays', svgClock())}
-        ${pmAiCard('Suggest Resources', svgPeople())}
-        ${pmAiCard('Risk Analysis', svgFlash())}
-        ${pmAiCard('Executive Summary', svgStar())}
-      </div>
-    </div>
-  `;
-  pmBuildHealthChart(projs);
-  pmBuildPriorityChart(projs);
-}
-function pmAiCard(title, icon) {
-  return `<div class="pm-ai-card" onclick="toast('AI features are coming in a future update','info')">${icon}<div class="ai-title">${title}</div><div class="ai-sub">AI placeholder</div></div>`;
-}
-function pmDeptHeatmapHtml(projs) {
-  const byDept = {}; PM_DEPARTMENTS.forEach(d=>byDept[d]=0);
-  projs.forEach(p=>{ if(p.department) byDept[p.department]=(byDept[p.department]||0)+1; });
-  const max = Math.max(1, ...Object.values(byDept));
-  return Object.entries(byDept).map(([d,c])=>`
-    <div class="pm-dept-row">
-      <div class="dept-name">${d}</div>
-      <div class="dept-bar-track"><div class="dept-bar-fill" style="width:${c/max*100}%;background:var(--primary)"></div></div>
-      <div class="dept-val">${c}</div>
-    </div>`).join('');
-}
-function pmTopRisksHtml(projs) {
-  const rows = [];
-  projs.forEach(p=>{ (p.risks||[]).filter(r=>!r.resolved).forEach(r=>rows.push({p,r})); });
-  if(!rows.length) return `<div style="color:var(--text3);font-size:12.5px">No open risks logged.</div>`;
-  return rows.slice(0,6).map(({p,r})=>`
-    <div class="pm-risk-item">
-      <span class="pm-health-dot ${(r.severity||'Medium')==='High'?'Delayed':'AtRisk'}"></span>
-      <div><strong>${p.name}</strong> — ${r.text}</div>
-    </div>`).join('');
-}
-function pmBuildHealthChart(projs) {
-  const ctx = document.getElementById('pm-ch-health'); if(!ctx) return;
-  const counts = {'On Track':0,'At Risk':0,'Delayed':0};
-  projs.forEach(p=>{ counts[p.health||'On Track']=(counts[p.health||'On Track']||0)+1; });
-  STATE.charts.pmHealth = new Chart(ctx, { type:'doughnut', data:{ labels:Object.keys(counts), datasets:[{ data:Object.values(counts), backgroundColor:['#22C55E','#F59E0B','#EF4444'] }] }, options:{ plugins:{ legend:{ position:'bottom', labels:{ boxWidth:10, font:{ size:11 } } } } } });
-}
-function pmBuildPriorityChart(projs) {
-  const ctx = document.getElementById('pm-ch-priority'); if(!ctx) return;
-  const byPri = {}; PM_PRIORITIES.forEach(p=>byPri[p]=[]);
-  projs.forEach(p=>{ (byPri[p.priority]=byPri[p.priority]||[]).push(p.progress||0); });
-  const labels = PM_PRIORITIES;
-  const data = labels.map(l=>{ const arr=byPri[l]||[]; return arr.length ? Math.round(arr.reduce((a,b)=>a+b,0)/arr.length) : 0; });
-  STATE.charts.pmPriority = new Chart(ctx, { type:'bar', data:{ labels, datasets:[{ label:'Avg Progress %', data, backgroundColor:'#0B4EA2', borderRadius:6 }] }, options:{ scales:{ y:{ beginAtZero:true, max:100 } }, plugins:{ legend:{ display:false } } } });
-}
-
-// ── BOARD VIEW (spreadsheet-style) ───────────────────────
-function pmRenderBoard() {
-  const st = STATE.pmBoard;
-  let list = STATE.pmProjects.slice();
-  list.forEach(p => { pmRecalcHealth(p); p.progress = pmProjectProgress(p); });
-  if (st.search) { const q=st.search.toLowerCase(); list = list.filter(p=>p.name.toLowerCase().includes(q) || (p.tags||[]).some(t=>t.toLowerCase().includes(q))); }
-  if (st.filterStatus) list = list.filter(p=>p.status===st.filterStatus);
-  if (st.filterHealth) list = list.filter(p=>p.health===st.filterHealth);
-  list.sort((a,b)=>{
-    let av = st.sortKey==='progress' ? a.progress : a[st.sortKey];
-    let bv = st.sortKey==='progress' ? b.progress : b[st.sortKey];
-    if (typeof av==='string') av=(av||'').toLowerCase();
-    if (typeof bv==='string') bv=(bv||'').toLowerCase();
-    if (av<bv) return st.sortDir==='asc' ? -1 : 1;
-    if (av>bv) return st.sortDir==='asc' ? 1 : -1;
-    return 0;
-  });
-
-  document.getElementById('content').innerHTML = `
-    ${pmTopBar('board')}
-    <div class="pm-filter-bar">
-      <input class="form-control" style="width:220px" placeholder="Search projects or tags…" value="${st.search}" oninput="pmBoardSearch(this.value)"/>
-      <select class="form-control" style="width:150px;padding:7px 10px" onchange="pmBoardFilterStatus(this.value)">
-        <option value="">All Status</option>
-        ${PM_PROJECT_STATUSES.map(s=>`<option value="${s}" ${st.filterStatus===s?'selected':''}>${s}</option>`).join('')}
-      </select>
-      <select class="form-control" style="width:150px;padding:7px 10px" onchange="pmBoardFilterHealth(this.value)">
-        <option value="">All Health</option>
-        ${PM_HEALTHS.map(h=>`<option value="${h}" ${st.filterHealth===h?'selected':''}>${h}</option>`).join('')}
-      </select>
-      <select class="form-control" style="width:170px;padding:7px 10px" onchange="pmBoardGroupBy(this.value)">
-        <option value="none" ${st.groupBy==='none'?'selected':''}>No Grouping</option>
-        <option value="status" ${st.groupBy==='status'?'selected':''}>Group by Status</option>
-        <option value="department" ${st.groupBy==='department'?'selected':''}>Group by Department</option>
-        <option value="health" ${st.groupBy==='health'?'selected':''}>Group by Health</option>
-      </select>
-      ${st.selected.length ? `<span style="font-size:12px;color:var(--text3)">${st.selected.length} selected</span>
-        <select class="form-control" style="width:170px;padding:7px 10px" onchange="pmBulkStatus(this.value)">
-          <option value="">Bulk set status…</option>
-          ${PM_PROJECT_STATUSES.map(s=>`<option value="${s}">${s}</option>`).join('')}
-        </select>` : ''}
-    </div>
-    <div class="pm-board-scroll">${pmBoardTableHtml(list)}</div>
-  `;
-}
-function pmBoardTableHtml(list) {
-  const st = STATE.pmBoard;
-  const groups = st.groupBy==='none' ? {'All Projects': list} : list.reduce((acc,p)=>{ const k=p[st.groupBy]||'—'; (acc[k]=acc[k]||[]).push(p); return acc; }, {});
-  const cols = PM_BOARD_COLS;
-  return `
-    <table class="pm-board-table">
-      <thead><tr>
-        <th class="pm-select-cell"><input type="checkbox" onchange='pmSelectAll(this.checked, ${JSON.stringify(list.map(p=>p.id))})'/></th>
-        ${cols.map(c=>`<th onclick="pmSortBy('${c.key}')">${c.label}${st.sortKey===c.key?`<span class="sort-ind">${st.sortDir==='asc'?'▲':'▼'}</span>`:''}</th>`).join('')}
-      </tr></thead>
-      <tbody>
-        ${Object.entries(groups).map(([g,rows])=>`
-          ${st.groupBy!=='none' ? `<tr class="pm-group-row"><td colspan="${cols.length+1}">${g}<span class="grp-count">${rows.length}</span></td></tr>` : ''}
-          ${rows.length ? rows.map(p=>pmBoardRowHtml(p)).join('') : `<tr><td colspan="${cols.length+1}" style="text-align:center;color:var(--text3);padding:20px">No projects</td></tr>`}
-        `).join('')}
-      </tbody>
-    </table>`;
-}
-function pmBoardRowHtml(p) {
-  const st = STATE.pmBoard;
-  const editable = canManageProjects();
-  const overdue = pmProjectOverdueTasks(p).length;
-  return `<tr>
-    <td class="pm-select-cell"><input type="checkbox" ${st.selected.includes(p.id)?'checked':''} onchange="pmToggleSelect('${p.id}')"/></td>
-    <td class="pm-cell-name" onclick="openProject('${p.id}')">${escHtml(p.name)}</td>
-    <td>${pmOwnerName(p.ownerId)}</td>
-    <td>${editable ? pmInlineSelect(p.id,'status',PM_PROJECT_STATUSES,p.status) : `<span class="pm-chip badge-gray">${p.status}</span>`}</td>
-    <td>${editable ? pmInlineSelect(p.id,'priority',PM_PRIORITIES,p.priority) : `<span class="pm-chip pm-pri-${p.priority}">${p.priority}</span>`}</td>
-    <td><span class="pm-chip pm-health-${slug(p.health||'On Track')}"><span class="pm-health-dot ${slug(p.health||'On Track')}"></span>${p.health||'On Track'}</span></td>
-    <td><div class="pm-progress-mini"><div class="bar-track"><div class="bar-fill" style="width:${p.progress||0}%"></div></div><span>${p.progress||0}%</span></div></td>
-    <td>${p.startDate||'—'} → ${p.targetDate||'—'}</td>
-    <td>${p.department||'—'}</td>
-    <td>${formatCurrency(p.budget)}</td>
-    <td>${(p.dependencies||[]).length}</td>
-    <td>${overdue>0 ? `<span class="pm-chip pm-health-Delayed">${overdue} overdue</span>` : `<span class="pm-chip badge-gray">None</span>`}</td>
-    <td>${(p.tags||[]).slice(0,3).map(t=>`<span class="pm-tag-chip" style="margin-right:3px">${t}</span>`).join('')}</td>
-    <td>${p.updatedAt||p.createdAt||'—'}</td>
-  </tr>`;
-}
-function pmInlineSelect(id, field, options, val) {
-  return `<select class="pm-inline-select" onclick="event.stopPropagation()" onchange="pmInlineUpdate('${id}','${field}',this.value)">
-    ${options.map(o=>`<option value="${o}" ${o===val?'selected':''}>${o}</option>`).join('')}
-  </select>`;
-}
-function pmInlineUpdate(id, field, value) {
-  const p = STATE.pmProjects.find(x=>x.id===id); if(!p) return;
-  p[field]=value; p.updatedAt=today();
-  if (field==='status' && value==='Completed') { p.actualEndDate=p.actualEndDate||today(); p.progress=100; p.health='On Track'; }
-  save(); pmRenderBoard();
-}
-function pmSortBy(key) { const st=STATE.pmBoard; if(st.sortKey===key){ st.sortDir = st.sortDir==='asc'?'desc':'asc'; } else { st.sortKey=key; st.sortDir='asc'; } pmRenderBoard(); }
-function pmBoardSearch(v) { STATE.pmBoard.search=v; pmRenderBoard(); }
-function pmBoardFilterStatus(v) { STATE.pmBoard.filterStatus=v; pmRenderBoard(); }
-function pmBoardFilterHealth(v) { STATE.pmBoard.filterHealth=v; pmRenderBoard(); }
-function pmBoardGroupBy(v) { STATE.pmBoard.groupBy=v; pmRenderBoard(); }
-function pmToggleSelect(id) { const s=STATE.pmBoard.selected; const i=s.indexOf(id); if(i>-1) s.splice(i,1); else s.push(id); pmRenderBoard(); }
-function pmSelectAll(checked, ids) { STATE.pmBoard.selected = checked ? ids : []; pmRenderBoard(); }
-function pmBulkStatus(status) {
-  if (!status || !canManageProjects()) return;
-  STATE.pmProjects.forEach(p=>{
-    if (STATE.pmBoard.selected.includes(p.id)) {
-      p.status=status; p.updatedAt=today();
-      if (status==='Completed') { p.progress=100; p.actualEndDate=p.actualEndDate||today(); p.health='On Track'; }
-    }
-  });
-  STATE.pmBoard.selected=[];
-  save(); toast('Projects updated','success'); pmRenderBoard();
-}
-
-// ── KANBAN VIEW (cross-project tasks) ────────────────────
-function pmRenderKanban() {
-  const tasks = STATE.pmTasks;
-  document.getElementById('content').innerHTML = `
-    ${pmTopBar('kanban')}
-    <div class="pm-board">
-      ${PM_TASK_STATUSES.map(s=>{
-        const colTasks = tasks.filter(t=>t.status===s);
-        return `<div class="pm-col">
-          <div class="pm-col-head">
-            <div class="pm-col-title"><span class="pm-col-dot" style="background:${pmStatusColor(s)}"></span>${s}</div>
-            <div style="display:flex;align-items:center;gap:6px">
-              <span class="pm-col-count">${colTasks.length}</span>
-              ${canManageProjects() ? `<span class="pm-col-add" onclick="openTaskModal(null,null,'${s}')">+</span>` : ''}
-            </div>
-          </div>
-          <div class="pm-col-body" ondragover="event.preventDefault(); this.classList.add('pm-drag-over')" ondragleave="this.classList.remove('pm-drag-over')" ondrop="pmDrop(event,'${s}')">
-            ${colTasks.length ? colTasks.map(t=>pmKanbanCardHtml(t)).join('') : `<div class="pm-empty-col">No tasks</div>`}
-          </div>
-        </div>`;
-      }).join('')}
-    </div>
-  `;
-}
-function pmKanbanCardHtml(t) {
-  const proj = STATE.pmProjects.find(p=>p.id===t.projectId);
-  const overdue = t.dueDate && t.dueDate<today() && t.status!=='Completed';
-  const canEdit = pmTaskCanEdit(t);
-  return `<div class="pm-card" draggable="${canEdit}" ondragstart="pmDragStart(event,'${t.id}')" onclick="openTaskModal('${t.projectId}','${t.id}')">
-    ${proj ? `<div class="pm-card-proj">${proj.name}</div>` : ''}
-    <div class="pm-card-title">${escHtml(t.title)}</div>
-    <div class="pm-card-progress"><div class="fill" style="width:${t.completionPercent||0}%"></div></div>
-    <div class="pm-card-foot">
-      <span class="pm-chip pm-pri-${t.priority}">${t.priority}</span>
-      ${t.assigneeId ? `<div class="avatar" style="width:22px;height:22px;font-size:9px" title="${pmEmpName(t.assigneeId)}">${initials(pmEmpName(t.assigneeId)||'?')}</div>` : `<span style="color:var(--text3);font-size:11px">Unassigned</span>`}
-    </div>
-    ${t.dueDate ? `<div class="pm-card-due ${overdue?'overdue':''}" style="margin-top:6px">${overdue?'Overdue: ':'Due '}${t.dueDate}</div>` : ''}
-  </div>`;
-}
-function pmDragStart(e, id) { e.dataTransfer.setData('text/plain', id); }
-function pmDrop(e, status) {
-  e.preventDefault(); e.currentTarget.classList.remove('pm-drag-over');
-  const id = e.dataTransfer.getData('text/plain');
-  const t = STATE.pmTasks.find(x=>x.id===id);
-  if (!t || !pmTaskCanEdit(t)) return;
-  t.status = status;
-  if (status==='Completed') { t.completionPercent=100; t.completedAt=today(); }
-  pmSyncProjectFromTasks(t.projectId);
-  save(); pmRenderKanban();
-}
-
-// ── PROJECT DETAIL PAGE ──────────────────────────────────
-function pmProjectDetail() {
-  const p = STATE.pmProjects.find(x=>x.id===STATE.pmProjectId);
-  if (!p) { STATE.pmProjectId=null; pmRenderDashboard(); return; }
-  pmRecalcHealth(p); p.progress = pmProjectProgress(p);
-  const tasks = pmProjectTasks(p.id);
-  const tab = STATE.pmDetailTab || 'overview';
-  document.getElementById('content').innerHTML = `
-    <div class="pm-back-link" onclick="backToProjects()">&larr; Back to Projects</div>
-    <div class="pm-detail-head">
-      <div style="display:flex;align-items:center;gap:16px">
-        <div class="pm-ring-wrap">${pmRingSvg(p.progress||0, p.color||'#0B4EA2')}<div class="pm-ring-label">${p.progress||0}%</div></div>
-        <div>
-          <h2 style="margin-bottom:4px">${p.name}</h2>
-          <div style="display:flex;gap:6px;flex-wrap:wrap">
-            <span class="pm-chip badge-gray">${p.status}</span>
-            <span class="pm-chip pm-pri-${p.priority}">${p.priority}</span>
-            <span class="pm-chip pm-health-${slug(p.health||'On Track')}">${p.health||'On Track'}</span>
-          </div>
-        </div>
-      </div>
-      ${canManageProjects() ? `<div style="display:flex;gap:8px">
-        <button class="btn btn-secondary btn-sm" onclick="openProjectModal('${p.id}')">Edit Project</button>
-        <button class="btn btn-danger btn-sm" onclick="confirmDeleteProject('${p.id}')">Delete</button>
-      </div>` : ''}
-    </div>
-    <div class="pm-detail-tabs">
-      ${['Overview','Tasks','Risks','Budget','Team'].map(tb=>`<div class="pm-detail-tab ${tab===tb.toLowerCase()?'active':''}" onclick="pmSetDetailTab('${tb.toLowerCase()}')">${tb}</div>`).join('')}
-    </div>
-    <div id="pm-detail-body">${pmDetailTabHtml(tab, p, tasks)}</div>
-  `;
-}
-function pmRingSvg(pct, color) {
-  const r=32, c=2*Math.PI*r, off=c-(c*pct/100);
-  return `<svg width="76" height="76" viewBox="0 0 76 76">
-    <circle cx="38" cy="38" r="${r}" stroke="var(--surface2)" stroke-width="8" fill="none"/>
-    <circle cx="38" cy="38" r="${r}" stroke="${color}" stroke-width="8" fill="none" stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${off}"/>
-  </svg>`;
-}
-function pmDetailTabHtml(tab, p, tasks) {
-  if (tab==='tasks') return pmDetailTasksTab(p, tasks);
-  if (tab==='risks') return pmDetailRisksTab(p);
-  if (tab==='budget') return pmDetailBudgetTab(p);
-  if (tab==='team') return pmDetailTeamTab(p, tasks);
-  return pmDetailOverviewTab(p, tasks);
-}
-function pmDetailOverviewTab(p, tasks) {
-  const milestones = tasks.filter(t=>(t.labels||[]).includes('Milestone'));
-  const healthScore = p.health==='On Track' ? 90 : p.health==='At Risk' ? 60 : 30;
-  return `
-    <div class="pm-dash-grid">
-      <div class="pm-panel">
-        <h4>Executive Summary</h4>
-        <p style="font-size:13px;color:var(--text2);line-height:1.6">${p.description || 'No description provided.'}</p>
-        <div style="display:flex;gap:20px;margin-top:16px;flex-wrap:wrap">
-          <div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Owner</div><div style="font-weight:700">${pmOwnerName(p.ownerId)}</div></div>
-          <div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Department</div><div style="font-weight:700">${p.department||'—'}</div></div>
-          <div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Timeline</div><div style="font-weight:700">${p.startDate||'—'} → ${p.targetDate||'—'}</div></div>
-          <div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Health Score</div><div style="font-weight:700">${healthScore}/100</div></div>
-        </div>
-      </div>
-      <div class="pm-panel">
-        <h4>Milestones</h4>
-        ${milestones.length ? milestones.map(m=>`<div class="pm-milestone"><span class="pm-health-dot ${m.status==='Completed'?'OnTrack':'AtRisk'}"></span><div style="flex:1">${m.title}</div><span style="color:var(--text3)">${m.dueDate||'—'}</span></div>`).join('') : `<div style="color:var(--text3);font-size:12.5px">Tag a task as "Milestone" to track it here.</div>`}
-      </div>
-      <div class="pm-panel">
-        <h4>Risks</h4>
-        ${(p.risks||[]).length ? p.risks.slice(0,5).map(r=>`<div class="pm-risk-item"><span class="pm-health-dot ${r.severity==='High'?'Delayed':'AtRisk'}"></span>${r.text}${r.resolved?' <span style="color:var(--green)">(resolved)</span>':''}</div>`).join('') : `<div style="color:var(--text3);font-size:12.5px">No risks logged.</div>`}
-      </div>
-      <div class="pm-panel">
-        <h4>Dependencies</h4>
-        ${(p.dependencies||[]).length ? p.dependencies.map(d=>`<div class="pm-risk-item">${d}</div>`).join('') : `<div style="color:var(--text3);font-size:12.5px">No dependencies logged.</div>`}
-      </div>
-    </div>`;
-}
-function pmDetailTasksTab(p, tasks) {
-  return `
-    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
-      ${canManageProjects() ? `<button class="btn btn-primary btn-sm" onclick="openTaskModal('${p.id}')">+ Add Task</button>` : ''}
-    </div>
-    <div class="pm-board-scroll">
-      <table class="pm-board-table" style="min-width:800px">
-        <thead><tr><th>Task</th><th>Assignee</th><th>Status</th><th>Priority</th><th>Due</th><th>Progress</th><th></th></tr></thead>
-        <tbody>
-          ${tasks.length ? tasks.map(t=>`
-            <tr>
-              <td class="pm-cell-name" onclick="openTaskModal('${p.id}','${t.id}')">${escHtml(t.title)}</td>
-              <td>${t.assigneeId ? pmEmpName(t.assigneeId) : 'Unassigned'}</td>
-              <td><span class="pm-chip pm-stat-${slug(t.status)}">${t.status}</span></td>
-              <td><span class="pm-chip pm-pri-${t.priority}">${t.priority}</span></td>
-              <td>${t.dueDate||'—'}</td>
-              <td><div class="pm-progress-mini"><div class="bar-track"><div class="bar-fill" style="width:${t.completionPercent||0}%"></div></div><span>${t.completionPercent||0}%</span></div></td>
-              <td>${pmTaskCanEdit(t) ? `<span style="cursor:pointer;color:var(--coral)" onclick="event.stopPropagation();deleteTask('${t.id}')">Delete</span>` : ''}</td>
-            </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:20px">No tasks yet</td></tr>`}
-        </tbody>
-      </table>
-    </div>`;
-}
-function pmDetailRisksTab(p) {
-  return `
-    ${canManageProjects() ? `
-    <div style="display:flex;gap:8px;margin-bottom:14px">
-      <input class="form-control" id="pm-risk-input" placeholder="Describe a new risk…" style="flex:1"/>
-      <select class="form-control" id="pm-risk-sev" style="width:120px"><option>Low</option><option selected>Medium</option><option>High</option></select>
-      <button class="btn btn-primary btn-sm" onclick="pmAddRisk('${p.id}')">Add Risk</button>
-    </div>` : ''}
-    <div class="pm-panel">
-      ${(p.risks||[]).length ? p.risks.map((r,i)=>`
-        <div class="pm-risk-item">
-          <span class="pm-health-dot ${r.severity==='High'?'Delayed':r.severity==='Low'?'OnTrack':'AtRisk'}"></span>
-          <div style="flex:1;${r.resolved?'text-decoration:line-through;color:var(--text3)':''}">${r.text} <span style="color:var(--text3)">(${r.severity})</span></div>
-          ${canManageProjects() ? `<span style="cursor:pointer;color:var(--primary);font-size:11.5px" onclick="pmToggleRisk('${p.id}',${i})">${r.resolved?'Reopen':'Resolve'}</span>` : ''}
-        </div>`).join('') : `<div style="color:var(--text3);font-size:12.5px">No risks logged for this project.</div>`}
-    </div>`;
-}
-function pmAddRisk(pid) {
-  const input = document.getElementById('pm-risk-input');
-  const text = input.value.trim(); if (!text) return;
-  const sev = document.getElementById('pm-risk-sev').value;
-  const p = STATE.pmProjects.find(x=>x.id===pid);
-  p.risks = p.risks || [];
-  p.risks.push({ text, severity:sev, resolved:false, createdAt:today() });
-  save(); toast('Risk logged','success'); pmSetDetailTab('risks');
-}
-function pmToggleRisk(pid, idx) {
-  const p = STATE.pmProjects.find(x=>x.id===pid);
-  p.risks[idx].resolved = !p.risks[idx].resolved;
-  save(); pmSetDetailTab('risks');
-}
-function pmDetailBudgetTab(p) {
-  const spentEst = (Number(p.budget)||0) * ((p.progress||0)/100);
-  const remaining = (Number(p.budget)||0) - spentEst;
-  return `
-    <div class="kpi-grid">
-      ${kpiCard('Total Budget', formatCurrency(p.budget), '', 'var(--primary)', 'var(--primary-lt)', svgChart())}
-      ${kpiCard('Estimated Spend', formatCurrency(spentEst), 'based on progress', 'var(--accent)', 'var(--accent-lt)', svgFlash())}
-      ${kpiCard('Remaining', formatCurrency(remaining), '', 'var(--green)', 'var(--green-lt)', svgStar())}
-    </div>
-    <div class="pm-panel" style="margin-top:16px">
-      <p style="font-size:12px;color:var(--text3)">Spend is estimated from task completion progress against total budget. Actual cost tracking can be wired up in a future phase.</p>
-    </div>`;
-}
-function pmDetailTeamTab(p, tasks) {
-  const ids = [...new Set([p.ownerId, ...tasks.map(t=>t.assigneeId)].filter(Boolean))];
-  return `
-    <div class="pm-board-scroll">
-      <table class="pm-board-table" style="min-width:600px">
-        <thead><tr><th>Member</th><th>Role</th><th>Open Tasks</th><th>Completed</th></tr></thead>
-        <tbody>
-          ${ids.length ? ids.map(id=>{
-            const e = STATE.employees.find(x=>x.id===id);
-            const own = tasks.filter(t=>t.assigneeId===id);
-            const open = own.filter(t=>t.status!=='Completed').length;
-            const done = own.filter(t=>t.status==='Completed').length;
-            return `<tr><td>${e?e.name:'Unknown'}</td><td>${id===p.ownerId?'Owner':'Contributor'}</td><td>${open}</td><td>${done}</td></tr>`;
-          }).join('') : `<tr><td colspan="4" style="text-align:center;color:var(--text3);padding:20px">No team members assigned yet</td></tr>`}
-        </tbody>
-      </table>
-    </div>`;
-}
-
-// ── PROJECT MODAL ─────────────────────────────────────────
-let pmTagBuffer = [];
-function openProjectModal(id) {
-  const p = id ? STATE.pmProjects.find(x=>x.id===id) : null;
-  pmTagBuffer = p ? [...(p.tags||[])] : [];
-  window._pmSelectedColor = p ? p.color : PM_PROJECT_COLORS[0];
-  const body = `
-    <div class="form-group"><label>Project Name</label><input class="form-control" id="pm-f-name" value="${p?escHtml(p.name):''}"/></div>
-    <div class="form-group"><label>Description</label><textarea class="form-control" id="pm-f-desc" rows="2">${p?escHtml(p.description||''):''}</textarea></div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-      <div class="form-group"><label>Owner</label><select class="form-control" id="pm-f-owner"><option value="">Unassigned</option>${STATE.employees.map(e=>`<option value="${e.id}" ${p&&p.ownerId===e.id?'selected':''}>${e.name}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Department</label><select class="form-control" id="pm-f-dept">${PM_DEPARTMENTS.map(d=>`<option ${p&&p.department===d?'selected':''}>${d}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Status</label><select class="form-control" id="pm-f-status">${PM_PROJECT_STATUSES.map(s=>`<option ${p&&p.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Priority</label><select class="form-control" id="pm-f-priority">${PM_PRIORITIES.map(s=>`<option ${p&&p.priority===s?'selected':''}>${s}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Start Date</label><input type="date" class="form-control" id="pm-f-start" value="${p?p.startDate||'':''}"/></div>
-      <div class="form-group"><label>Target Date</label><input type="date" class="form-control" id="pm-f-target" value="${p?p.targetDate||'':''}"/></div>
-      <div class="form-group"><label>Budget ($)</label><input type="number" class="form-control" id="pm-f-budget" value="${p?p.budget||0:0}"/></div>
-    </div>
-    <div class="form-group"><label>Tags</label><div class="pm-tag-input-wrap" id="pm-tag-wrap">
-      ${pmTagBuffer.map(t=>`<span class="pm-tag-chip">${escHtml(t)}<span onclick="pmRemoveTag('${escJsAttr(t)}')">×</span></span>`).join('')}
-      <input id="pm-tag-in" placeholder="Add tag, press Enter" onkeydown="pmAddTagFromInput(event)"/>
-    </div></div>
-    <div class="form-group"><label>Color</label><div class="pm-swatch-row" id="pm-color-row">
-      ${PM_PROJECT_COLORS.map(c=>`<div class="pm-swatch ${window._pmSelectedColor===c?'selected':''}" style="background:${c}" onclick="pmPickColor(this,'${c}')"></div>`).join('')}
-    </div></div>
-  `;
-  openModal(p?'Edit Project':'New Project', body, [
-    {label:'Cancel', cls:'btn-secondary', fn:'closeModal()'},
-    {label:p?'Save Changes':'Create Project', cls:'btn-primary', fn:`saveProject(${p?`'${p.id}'`:'null'})`}
-  ], true);
-}
-function pmPickColor(el, c) {
-  document.querySelectorAll('#pm-color-row .pm-swatch').forEach(s=>s.classList.remove('selected'));
-  el.classList.add('selected'); window._pmSelectedColor = c;
-}
-function pmAddTagFromInput(e) {
-  if (e.key==='Enter' && e.target.value.trim()) { e.preventDefault(); pmTagBuffer.push(e.target.value.trim()); e.target.value=''; pmRefreshTagWrap(); }
-}
-function pmRemoveTag(t) { pmTagBuffer = pmTagBuffer.filter(x=>x!==t); pmRefreshTagWrap(); }
-function pmRefreshTagWrap() {
-  document.getElementById('pm-tag-wrap').innerHTML =
-    pmTagBuffer.map(t=>`<span class="pm-tag-chip">${escHtml(t)}<span onclick="pmRemoveTag('${escJsAttr(t)}')">×</span></span>`).join('') +
-    `<input id="pm-tag-in" placeholder="Add tag, press Enter" onkeydown="pmAddTagFromInput(event)"/>`;
-}
-function saveProject(id) {
-  const name = document.getElementById('pm-f-name').value.trim();
-  if (!name) { toast('Project name is required','error'); return; }
-  const data = {
-    name,
-    description: document.getElementById('pm-f-desc').value.trim(),
-    ownerId: document.getElementById('pm-f-owner').value || null,
-    department: document.getElementById('pm-f-dept').value,
-    status: document.getElementById('pm-f-status').value,
-    priority: document.getElementById('pm-f-priority').value,
-    startDate: document.getElementById('pm-f-start').value,
-    targetDate: document.getElementById('pm-f-target').value,
-    budget: Number(document.getElementById('pm-f-budget').value) || 0,
-    tags: [...pmTagBuffer],
-    color: window._pmSelectedColor || PM_PROJECT_COLORS[0],
-    updatedAt: today()
-  };
-  if (id) {
-    Object.assign(STATE.pmProjects.find(x=>x.id===id), data);
-    toast('Project updated','success');
-  } else {
-    STATE.pmProjects.push({ id:uid(), ...data, health:'On Track', progress:0, risks:[], dependencies:[], actualEndDate:null, createdAt:today() });
-    toast('Project created','success');
-  }
-  save(); closeModal(); render();
-}
-function deleteProject(id) {
-  STATE.pmProjects = STATE.pmProjects.filter(p=>p.id!==id);
-  STATE.pmTasks = STATE.pmTasks.filter(t=>t.projectId!==id);
-  save();
-}
-function confirmDeleteProject(id) {
-  const p = STATE.pmProjects.find(x=>x.id===id);
-  openModal('Delete Project', `<p>Delete <strong>${p.name}</strong> and all of its tasks? This cannot be undone.</p>`, [
-    {label:'Cancel', cls:'btn-secondary', fn:'closeModal()'},
-    {label:'Delete', cls:'btn-danger', fn:`deleteProject('${id}'); closeModal(); backToProjects();`}
-  ]);
-}
-
-// ── TASK MODAL ────────────────────────────────────────────
-function openTaskModal(projectId, id, presetStatus) {
-  const t = id ? STATE.pmTasks.find(x=>x.id===id) : null;
-  const pid = projectId || (t ? t.projectId : (STATE.pmProjects[0] && STATE.pmProjects[0].id));
-  if (!pid) { toast('Create a project first','error'); return; }
-  const body = `
-    <div class="form-group"><label>Project</label><select class="form-control" id="pm-t-project" ${!canManageProjects()?'disabled':''} onchange="pmTaskProjectChanged()">${STATE.pmProjects.map(p=>`<option value="${p.id}" ${p.id===pid?'selected':''}>${escHtml(p.name)}</option>`).join('')}</select></div>
-    <div class="form-group"><label>Title</label><input class="form-control" id="pm-t-title" value="${t?escHtml(t.title):''}"/></div>
-    <div class="form-group"><label>Description</label><textarea class="form-control" id="pm-t-desc" rows="2">${t?escHtml(t.description||''):''}</textarea></div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-      <div class="form-group"><label>Assignee</label><select class="form-control" id="pm-t-assignee"><option value="">Unassigned</option>${STATE.employees.map(e=>`<option value="${e.id}" ${t&&t.assigneeId===e.id?'selected':''}>${e.name}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Priority</label><select class="form-control" id="pm-t-priority">${PM_PRIORITIES.map(p=>`<option ${t&&t.priority===p?'selected':''}>${p}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Status</label><select class="form-control" id="pm-t-status">${PM_TASK_STATUSES.map(s=>`<option ${(t?t.status:(presetStatus||'Backlog'))===s?'selected':''}>${s}</option>`).join('')}</select></div>
-      <div class="form-group"><label>Completion %</label><input type="number" min="0" max="100" class="form-control" id="pm-t-pct" value="${t?t.completionPercent||0:0}"/></div>
-      <div class="form-group"><label>Start Date</label><input type="date" class="form-control" id="pm-t-start" ${STATE.pmProjects.find(x=>x.id===pid)?.targetDate?`max="${STATE.pmProjects.find(x=>x.id===pid).targetDate}"`:''} value="${t?t.startDate||'':''}"/></div>
-      <div class="form-group"><label>Due Date</label><input type="date" class="form-control" id="pm-t-due" ${STATE.pmProjects.find(x=>x.id===pid)?.targetDate?`max="${STATE.pmProjects.find(x=>x.id===pid).targetDate}"`:''} value="${t?t.dueDate||'':''}"/></div>
-      <div class="form-group" id="pm-t-target-hint" style="grid-column:1 / -1;font-size:11.5px;color:var(--text3);margin-top:-6px">${STATE.pmProjects.find(x=>x.id===pid)?.targetDate?`Project completion date: ${STATE.pmProjects.find(x=>x.id===pid).targetDate}. Task dates cannot go past this.`:''}</div>
-      <div class="form-group"><label>Estimated Hours</label><input type="number" class="form-control" id="pm-t-est" value="${t?t.estimatedHours||0:0}"/></div>
-      <div class="form-group"><label>Actual Hours</label><input type="number" class="form-control" id="pm-t-act" value="${t?t.actualHours||0:0}"/></div>
-    </div>
-    <div class="form-group"><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="pm-t-milestone" ${t&&(t.labels||[]).includes('Milestone')?'checked':''} style="width:auto"/> Mark as Milestone</label></div>
-  `;
-  openModal(t?'Edit Task':'New Task', body, [
-    {label:'Cancel', cls:'btn-secondary', fn:'closeModal()'},
-    ...(t && pmTaskCanEdit(t) ? [{label:'Delete', cls:'btn-danger', fn:`deleteTask('${t.id}')`}] : []),
-    {label:t?'Save Changes':'Create Task', cls:'btn-primary', fn:`saveTask(${t?`'${t.id}'`:'null'})`}
-  ], true);
-}
-function pmTaskProjectChanged() {
-  const projectId = document.getElementById('pm-t-project').value;
-  const proj = STATE.pmProjects.find(x=>x.id===projectId);
-  const startEl = document.getElementById('pm-t-start');
-  const dueEl = document.getElementById('pm-t-due');
-  const hintEl = document.getElementById('pm-t-target-hint');
-  if (proj && proj.targetDate) {
-    startEl.max = proj.targetDate;
-    dueEl.max = proj.targetDate;
-    if (startEl.value && startEl.value > proj.targetDate) startEl.value = proj.targetDate;
-    if (dueEl.value && dueEl.value > proj.targetDate) dueEl.value = proj.targetDate;
-    hintEl.textContent = `Project completion date: ${proj.targetDate}. Task dates cannot go past this.`;
-  } else {
-    startEl.removeAttribute('max'); dueEl.removeAttribute('max'); hintEl.textContent = '';
-  }
-}
-function saveTask(id) {
-  const title = document.getElementById('pm-t-title').value.trim();
-  if (!title) { toast('Task title is required','error'); return; }
-  const projectId = document.getElementById('pm-t-project').value;
-  const status = document.getElementById('pm-t-status').value;
-  const proj = STATE.pmProjects.find(x=>x.id===projectId);
-  const taskStart = document.getElementById('pm-t-start').value;
-  const taskDue = document.getElementById('pm-t-due').value;
-  if (proj && proj.targetDate) {
-    if (taskStart && taskStart > proj.targetDate) { toast(`Start date cannot be after the project's completion date (${proj.targetDate})`,'error'); return; }
-    if (taskDue && taskDue > proj.targetDate) { toast(`Due date cannot be after the project's completion date (${proj.targetDate})`,'error'); return; }
-  }
-  if (taskStart && taskDue && taskDue < taskStart) { toast('Due date cannot be before the start date','error'); return; }
-  const pct = Math.max(0, Math.min(100, Number(document.getElementById('pm-t-pct').value)||0));
-  const labels = document.getElementById('pm-t-milestone').checked ? ['Milestone'] : [];
-  const data = {
-    projectId, title,
-    description: document.getElementById('pm-t-desc').value.trim(),
-    assigneeId: document.getElementById('pm-t-assignee').value || null,
-    priority: document.getElementById('pm-t-priority').value,
-    status,
-    completionPercent: status==='Completed' ? 100 : pct,
-    startDate: document.getElementById('pm-t-start').value,
-    dueDate: document.getElementById('pm-t-due').value,
-    estimatedHours: Number(document.getElementById('pm-t-est').value)||0,
-    actualHours: Number(document.getElementById('pm-t-act').value)||0,
-    labels
-  };
-  if (id) {
-    const t = STATE.pmTasks.find(x=>x.id===id);
-    if (!pmTaskCanEdit(t)) { toast('You cannot edit this task','error'); return; }
-    Object.assign(t, data, { completedAt: status==='Completed' ? (t.completedAt||today()) : null });
-    toast('Task updated','success');
-  } else {
-    if (!canManageProjects()) { toast('You cannot create tasks','error'); return; }
-    STATE.pmTasks.push({ id:uid(), ...data, reporterId:myEmpId(), dependencies:[], blockers:[], comments:[], attachments:[], parentTaskId:null, completedAt: status==='Completed'?today():null, createdAt:today() });
-    toast('Task created','success');
-  }
-  pmSyncProjectFromTasks(projectId);
-  save(); closeModal(); render();
-}
-function deleteTask(id) {
-  const t = STATE.pmTasks.find(x=>x.id===id);
-  if (!t || !pmTaskCanEdit(t)) return;
-  const pid = t.projectId;
-  STATE.pmTasks = STATE.pmTasks.filter(x=>x.id!==id);
-  pmSyncProjectFromTasks(pid);
-  save(); closeModal(); toast('Task deleted','success'); render();
-}
-
-// ═══════════════════════════════════════════════════════════
 // MODAL HELPER
 // ═══════════════════════════════════════════════════════════
 function openModal(title, body, actions=[], isLg=false) {
@@ -4317,23 +3631,6 @@ function seedData() {
   STATE.qualityReviews = [
     {id:uid(),employeeId:emps[0].id,taskName:'Daily Revenue Report',result:'Passed',severity:'',errorCount:0,lateDelivery:false,reviewDate:today(),year:y,month:m},
     {id:uid(),employeeId:emps[1].id,taskName:'Q3 Executive Deck',result:'Rework Required',severity:'Medium',errorCount:2,lateDelivery:true,reviewDate:today(),year:y,month:m},
-  ];
-
-  // Sample projects + tasks for the Projects module
-  const addDays = (n) => fmtDate(new Date(Date.now() + n*86400000));
-  const proj1 = {id:uid(), name:'Q4 Analytics Revamp', description:'Modernize the analytics stack and refresh core dashboards for Q4 stakeholders.', ownerId:emps[0].id, status:'Active', health:'On Track', budget:45000, startDate:addDays(-10), targetDate:addDays(20), actualEndDate:null, progress:0, priority:'High', department:'Analytics', color:'#0B4EA2', tags:['dashboards','q4'], risks:[{text:'Vendor API may deprecate before rollout', severity:'Medium', resolved:false, createdAt:today()}], dependencies:['Data warehouse migration'], createdAt:today(), updatedAt:today()};
-  const proj2 = {id:uid(), name:'Client Onboarding Portal', description:'Self-serve onboarding flow for new logistics accounts.', ownerId:emps[2].id, status:'On Hold', health:'At Risk', budget:28000, startDate:addDays(-5), targetDate:addDays(35), actualEndDate:null, progress:0, priority:'Medium', department:'Engineering', color:'#0D9488', tags:['portal','onboarding'], risks:[], dependencies:[], createdAt:today(), updatedAt:today()};
-  STATE.pmProjects = [proj1, proj2];
-
-  STATE.pmTasks = [
-    {id:uid(), projectId:proj1.id, parentTaskId:null, title:'Audit existing dashboard inventory', description:'Catalogue all live dashboards and flag stale ones.', assigneeId:emps[1].id, reporterId:emps[0].id, status:'Completed', priority:'Medium', startDate:addDays(-9), dueDate:addDays(-3), estimatedHours:8, actualHours:7, completionPercent:100, labels:[], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:addDays(-3)},
-    {id:uid(), projectId:proj1.id, parentTaskId:null, title:'Design new KPI schema', description:'Define standardized KPI naming and calculation rules.', assigneeId:emps[0].id, reporterId:emps[0].id, status:'In Progress', priority:'High', startDate:addDays(-4), dueDate:addDays(4), estimatedHours:12, actualHours:5, completionPercent:45, labels:['Milestone'], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:null},
-    {id:uid(), projectId:proj1.id, parentTaskId:null, title:'Rebuild revenue dashboard', description:'Migrate to new schema and refresh visuals.', assigneeId:emps[2].id, reporterId:emps[0].id, status:'In Progress', priority:'High', startDate:addDays(-2), dueDate:addDays(6), estimatedHours:16, actualHours:6, completionPercent:30, labels:[], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:null},
-    {id:uid(), projectId:proj1.id, parentTaskId:null, title:'Stakeholder review session', description:'Walkthrough with leadership for sign-off.', assigneeId:emps[0].id, reporterId:emps[0].id, status:'Planned', priority:'Urgent', startDate:addDays(7), dueDate:addDays(9), estimatedHours:3, actualHours:0, completionPercent:0, labels:['Milestone'], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:null},
-    {id:uid(), projectId:proj1.id, parentTaskId:null, title:'QA pass on new dashboards', description:'Cross-check figures against source reports.', assigneeId:emps[3].id, reporterId:emps[0].id, status:'Review', priority:'Medium', startDate:addDays(3), dueDate:addDays(-1), estimatedHours:6, actualHours:2, completionPercent:60, labels:[], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:null},
-    {id:uid(), projectId:proj1.id, parentTaskId:null, title:'Publish rollout announcement', description:'Comms to all teams about the new dashboards.', assigneeId:null, reporterId:emps[0].id, status:'Backlog', priority:'Low', startDate:addDays(10), dueDate:addDays(12), estimatedHours:2, actualHours:0, completionPercent:0, labels:[], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:null},
-    {id:uid(), projectId:proj2.id, parentTaskId:null, title:'Map onboarding user journey', description:'Document each step a new client goes through.', assigneeId:emps[2].id, reporterId:emps[2].id, status:'Backlog', priority:'Medium', startDate:addDays(0), dueDate:addDays(8), estimatedHours:8, actualHours:0, completionPercent:0, labels:[], dependencies:[], blockers:[], comments:[], attachments:[], createdAt:today(), completedAt:null},
-    {id:uid(), projectId:proj2.id, parentTaskId:null, title:'Draft portal wireframes', description:'Low-fidelity wireframes for review.', assigneeId:emps[3].id, reporterId:emps[2].id, status:'Blocked', priority:'Low', startDate:addDays(2), dueDate:addDays(15), estimatedHours:10, actualHours:1, completionPercent:10, labels:[], dependencies:[], blockers:['Waiting on brand guidelines'], comments:[], attachments:[], createdAt:today(), completedAt:null},
   ];
 
   save();
