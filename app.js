@@ -61,6 +61,7 @@ const STATE = {
   leaves: [],
   regularReports: [],
   assignments: [],   // regular report assignments {id, reportId, employeeId, assignedDate}
+  reportCompletions: [], // per-occurrence completion log {id, reportId, employeeId, periodKey ('M:YYYY-MM' | 'W:<Monday YYYY-MM-DD>'), dueDate, completedDate, markedBy, note, createdAt}
   adhocTasks: [],
   qualityReviews: [],
   surveyResponses: [], // {id, taskId, employeeId, satisfaction(1-5), onTime(bool), quality(1-5), comments, score(0-100), year, month, recordedAt}
@@ -71,8 +72,10 @@ const STATE = {
   currentMonth: new Date().getMonth(),
   currentYear: new Date().getFullYear(),
   currentPage: 'dashboard',
+  reportTeamFilter: 'pending', reportTeamEmp: '', // UI-only filters for the manager Team Report Tracker
   showCompletedAdhoc: false, // UI-only toggle for Adhoc Tasks table, not persisted
   settings: {
+    reportTrackingStart: '', // first date regular-report completion is enforced (set automatically on first login; admin can change it on the Regular Reports page)
     surveyInboxEmail: 'adhocsupport@yourcompany.com' // shared inbox that receives click-to-reply survey answers — edit in Adhoc Tasks page
   },
   notifications: [], // in-app activity log — {id,type,title,message,taskId,read,createdAt}, newest first, capped at 200
@@ -104,7 +107,7 @@ const STATE = {
 //   create policy "Authenticated can update" on workpulse_data for update using (auth.role() = 'authenticated');
 //   alter publication supabase_realtime add table workpulse_data;  -- enables realtime for this table
 //
-const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','notifications'];
+const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','reportCompletions','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','notifications'];
 const DATA_TABLE = 'workpulse_data';
 
 let _realtimeChannel = null;
@@ -209,6 +212,8 @@ function stopSync() {
   _initialLoadDone = false;
   initialDataLoaded = false;
   isLoading = true;
+  DATA_DOC_KEYS.forEach(k => { STATE[k] = []; });
+  _remoteCache = {};
 }
 
 // Writes collections + settings back to Supabase in one upsert — but ONLY
@@ -409,7 +414,7 @@ const PAGE_TITLES = {
 const PAGE_ACCESS = {
   admin:   ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','quality','performance','holidays','skills','teams'],
   manager: ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','quality','performance','holidays','skills','teams'],
-  member:  ['dashboard','adhoc','performance']  // everything else shows locked
+  member:  ['dashboard','regular','adhoc','performance']  // everything else shows locked
 };
 
 function showLogin() {
@@ -458,13 +463,24 @@ sb.auth.onAuthStateChange((event, session) => {
   if(isFirstReport) {
     authReady = true;
     if(_onAuthReadyCallback) { const cb = _onAuthReadyCallback; _onAuthReadyCallback = null; cb(); }
+  } else if(user && !_initialLoadDone) {
+    // Signed in after a signed-out cold load (or after a logout): load the data
+    // NOW, as the authenticated user. setTimeout(0) keeps supabase calls out of
+    // the auth callback itself (avoids a known supabase-js lock deadlock).
+    setTimeout(() => startSync(() => {
+      setSyncStatus('connected');
+      resolveAuthUser(user);
+    }), 0);
   } else if(_initialLoadDone) {
+    // supabase-js re-fires SIGNED_IN on tab refocus — don't reset the page for the same user
+    if(user && STATE.currentUser && STATE.currentUser.authUid === user.id) return;
     resolveAuthUser(user);
   }
 });
 
 function resolveAuthUser(user) {
   if(!user) {
+    stopSync();
     STATE.currentUser = null;
     const badge = document.getElementById('user-badge');
     if(badge) badge.style.display = 'none';
@@ -489,6 +505,7 @@ function resolveAuthUser(user) {
 }
 
 function afterLogin() {
+  ensureReportTrackingStart();
   hideLogin();
   updateUserBadge();
   updateNotificationBadge();
@@ -625,6 +642,302 @@ function render() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// REGULAR REPORT COMPLETION TRACKING
+// Every report is either Monthly (due on the Nth working day of the month)
+// or Weekly (due on a chosen weekday, Mon–Fri, of every week). Completion is
+// tracked per OCCURRENCE (one record per report + employee + period), so a
+// weekly report has ~4–5 completions a month and a monthly report has 1.
+//   periodKey  Monthly → 'M:YYYY-MM'      Weekly → 'W:<Monday of that week>'
+// Scoring: on time = 100% credit, late = REPORT_LATE_CREDIT, overdue and
+// never completed = 0, not yet due = ignored. Occurrences due before the
+// tracking start date (or before the assignment date) are not counted, so
+// turning this on doesn't retroactively penalise anyone.
+// ═══════════════════════════════════════════════════════════
+const REPORT_LATE_CREDIT = 0.5;
+const WEEKDAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+function ensureReportTrackingStart() {
+  if(!STATE.settings.reportTrackingStart) {
+    STATE.settings.reportTrackingStart = today();
+    save();
+  }
+}
+function setReportTrackingStart(val) {
+  if(!isAdmin()) return;
+  STATE.settings.reportTrackingStart = val || today();
+  save(); toast('Completion tracking start date updated','success'); render();
+}
+
+function reportFreq(rep) { return rep && rep.frequency==='Weekly' ? 'Weekly' : 'Monthly'; }
+function shortDate(d) { const x = d instanceof Date ? d : parseDate(d); return x.getDate()+' '+monthName(x.getMonth()).slice(0,3); }
+function mondayOf(d) {
+  const x = d instanceof Date ? new Date(d) : parseDate(d);
+  x.setDate(x.getDate() - ((x.getDay()+6)%7));
+  x.setHours(0,0,0,0);
+  return x;
+}
+function weeklyDueDate(rep, monday) {
+  const wd = Math.min(5, Math.max(1, parseInt(rep.dueWeekday)||5));
+  const d = new Date(monday);
+  d.setDate(d.getDate() + wd - 1);
+  for(let i=0; i<7 && !isWorkingDay(d); i++) d.setDate(d.getDate()+1); // holiday → next working day
+  return fmtDate(d);
+}
+function isReportDueOn(rep, dateStr, wdNum) {
+  if(reportFreq(rep)==='Weekly') return weeklyDueDate(rep, mondayOf(dateStr)) === dateStr;
+  return parseInt(rep.dueWorkingDay) === wdNum;
+}
+function reportDueLabel(rep) {
+  return reportFreq(rep)==='Weekly'
+    ? 'Weekly · ' + WEEKDAY_SHORT[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
+    : 'Monthly · Day ' + (rep.dueWorkingDay||1);
+}
+
+// All due periods of one report whose due date falls in the given month
+function reportPeriods(rep, y, m) {
+  const out = [];
+  if(reportFreq(rep)==='Weekly') {
+    const last = new Date(y, m+1, 0);
+    const mon = mondayOf(new Date(y, m, 1));
+    mon.setDate(mon.getDate() - 7);
+    while(mon <= last) {
+      const due = weeklyDueDate(rep, mon);
+      const dd = parseDate(due);
+      if(dd.getFullYear()===y && dd.getMonth()===m)
+        out.push({periodKey:'W:'+fmtDate(mon), label:'Week of '+shortDate(mon), dueDate:due});
+      mon.setDate(mon.getDate() + 7);
+    }
+  } else {
+    const wds = getWorkingDays(y, m);
+    if(!wds.length) return out;
+    const n = parseInt(rep.dueWorkingDay) || 1;
+    out.push({periodKey:'M:'+y+'-'+String(m+1).padStart(2,'0'), label:monthName(m)+' '+y, dueDate: wds[n-1] || wds[wds.length-1]});
+  }
+  return out;
+}
+
+function getReportCompletion(reportId, empId, periodKey) {
+  return STATE.reportCompletions.find(c=>c.reportId===reportId && c.employeeId===empId && c.periodKey===periodKey) || null;
+}
+
+// Every occurrence for an employee in a month, with status + credit
+function getReportOccurrences(empId, y, m) {
+  const t = today();
+  const start = STATE.settings.reportTrackingStart || '';
+  const out = [];
+  STATE.assignments.filter(a=>a.employeeId===empId).forEach(a=>{
+    const rep = STATE.regularReports.find(r=>r.id===a.reportId);
+    if(!rep) return;
+    reportPeriods(rep, y, m).forEach(p=>{
+      const c = getReportCompletion(rep.id, empId, p.periodKey);
+      let status, credit = 0, counted = false;
+      if(c) {
+        status = c.completedDate <= p.dueDate ? 'On Time' : 'Late';
+        credit = status==='On Time' ? 1 : REPORT_LATE_CREDIT;
+        counted = true;
+      } else if(p.dueDate < t) {
+        const inScope = (!start || p.dueDate >= start) && (!a.assignedDate || p.dueDate >= a.assignedDate);
+        status = inScope ? 'Overdue' : 'Not Tracked';
+        counted = inScope;
+      } else {
+        status = p.dueDate===t ? 'Due Today' : 'Upcoming';
+      }
+      out.push({assignment:a, report:rep, periodKey:p.periodKey, label:p.label, dueDate:p.dueDate, completion:c, status, credit, counted});
+    });
+  });
+  return out.sort((a,b)=>a.dueDate.localeCompare(b.dueDate) || a.report.name.localeCompare(b.report.name));
+}
+
+function getReportScore(empId, y, m) {
+  const occ = getReportOccurrences(empId, y, m).filter(o=>o.counted);
+  const due = occ.length;
+  const onTime = occ.filter(o=>o.status==='On Time').length;
+  const late = occ.filter(o=>o.status==='Late').length;
+  const overdue = occ.filter(o=>o.status==='Overdue').length;
+  const score = due ? Math.round(occ.reduce((s,o)=>s+o.credit,0)/due*100) : 100;
+  return {score, due, onTime, late, overdue, done:onTime+late};
+}
+
+function reportStatusBadge(status) {
+  const map = {'On Time':'badge-green','Late':'badge-amber','Overdue':'badge-red','Due Today':'badge-blue','Upcoming':'badge-gray','Not Tracked':'badge-gray'};
+  return `<span class="badge ${map[status]||'badge-gray'}">${status}</span>`;
+}
+
+function canManageReportsFor(empId) {
+  if(isAdmin()) return true;
+  if(isManager()) return visibleEmployees().some(e=>e.id===empId);
+  return false;
+}
+function canMarkReportFor(empId) {
+  return canManageReportsFor(empId) || (isMember() && empId===myEmpId());
+}
+
+function recordReportCompletion(reportId, empId, periodKey, dueDate, completedDate, note, completedAt) {
+  const existing = getReportCompletion(reportId, empId, periodKey);
+  if(existing) {
+    existing.completedDate = completedDate;
+    existing.completedAt = completedAt || null;   // exact time only when closed via the button
+    existing.markedBy = STATE.currentUser?.name || '';
+    if(note!==undefined) existing.note = note;
+  } else {
+    STATE.reportCompletions.push({id:uid(), reportId, employeeId:empId, periodKey, dueDate, completedDate, completedAt: completedAt || null,
+      markedBy: STATE.currentUser?.name || '', note: note||'', createdAt: new Date().toISOString()});
+  }
+  save();
+}
+
+function afterReportChange(empId) {
+  if(document.getElementById('emp-tab-content') && document.getElementById('modal-overlay').classList.contains('active')) {
+    switchEmpTab('reports', empId);   // manager is looking at the employee profile
+  }
+  if(STATE.currentPage==='dashboard' || STATE.currentPage==='regular' || STATE.currentPage==='performance') render();
+}
+
+// Employee (own) or manager/admin clicks "Mark Complete" — completion date = today
+function markReportComplete(reportId, empId, periodKey, dueDate) {
+  if(!canMarkReportFor(empId)) { toast('You can only update your own reports','error'); return; }
+  const t = today();
+  if(t > dueDate && !confirm('This report was due on '+dueDate+'. Closing it now will be recorded as LATE and earns only '+Math.round(REPORT_LATE_CREDIT*100)+'% credit toward the performance score. Close it anyway?')) return;
+  recordReportCompletion(reportId, empId, periodKey, dueDate, t, undefined, new Date().toISOString());
+  toast(t<=dueDate ? 'Marked complete — on time' : 'Marked complete — late, partial credit applies', t<=dueDate?'success':'info');
+  afterReportChange(empId);
+}
+
+// Manager/admin: set or correct the completion date (e.g. finished earlier but not logged)
+function editReportCompletionDate(reportId, empId, periodKey, dueDate) {
+  if(!canManageReportsFor(empId)) return;
+  const c = getReportCompletion(reportId, empId, periodKey);
+  const val = prompt('Completion date (YYYY-MM-DD)', c ? c.completedDate : today());
+  if(val===null) return;
+  const v = val.trim();
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(v) || isNaN(parseDate(v).getTime())) { toast('Enter the date as YYYY-MM-DD','error'); return; }
+  if(v > today()) { toast('Completion date cannot be in the future','error'); return; }
+  recordReportCompletion(reportId, empId, periodKey, dueDate, v);
+  toast(v<=dueDate ? 'Saved — on time' : 'Saved — late, partial credit applies','success');
+  afterReportChange(empId);
+}
+
+function undoReportCompletion(reportId, empId, periodKey) {
+  const c = getReportCompletion(reportId, empId, periodKey);
+  if(!c) return;
+  const mine = isMember() && empId===myEmpId() && c.completedDate===today(); // members can only undo same-day mistakes
+  if(!canManageReportsFor(empId) && !mine) { toast('Only your manager can undo an earlier completion','error'); return; }
+  if(!confirm('Undo this completion and mark the report as not done?')) return;
+  STATE.reportCompletions = STATE.reportCompletions.filter(x=>x.id!==c.id);
+  save(); toast('Completion removed','info');
+  afterReportChange(empId);
+}
+
+function fmtCompletedAt(c) {
+  if(!c.completedAt) return c.completedDate;
+  const d = new Date(c.completedAt);
+  return c.completedDate + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+
+function reportActionButtons(o, empId) {
+  const args = `'${o.report.id}','${empId}','${o.periodKey}','${o.dueDate}'`;
+  if(!o.completion) {
+    if(!canMarkReportFor(empId)) return '<span style="color:var(--text3)">—</span>';
+    return `<button class="btn btn-primary btn-sm" onclick="markReportComplete(${args})">✓ Close Report</button>`;
+  }
+  const canManage = canManageReportsFor(empId);
+  const canUndo = canManage || (isMember() && empId===myEmpId() && o.completion.completedDate===today());
+  return `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+    <span style="font-size:11px;color:var(--text3)">Closed ${fmtCompletedAt(o.completion)}${o.completion.markedBy ? ' · by '+escHtml(o.completion.markedBy) : ''}</span>
+    ${canManage ? `<button class="btn btn-secondary btn-sm" onclick="editReportCompletionDate(${args})">Edit date</button>` : ''}
+    ${canUndo ? `<button class="btn btn-danger btn-sm" onclick="undoReportCompletion('${o.report.id}','${empId}','${o.periodKey}')">Undo</button>` : ''}
+  </div>`;
+}
+
+function reportOccurrencesTable(occ, empId) {
+  if(!occ.length) return `<div class="empty-state"><p>No regular reports due in ${selectedMonthLabel()}</p></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Report</th><th>Period</th><th>Due</th><th>Est Hours</th><th>Priority</th><th>Status</th><th>Action</th></tr></thead><tbody>
+    ${occ.map(o=>`<tr>
+      <td><strong>${escHtml(o.report.name)}</strong><br><small style="color:var(--text3)">${reportDueLabel(o.report)}</small></td>
+      <td>${o.label}</td>
+      <td>${o.dueDate}</td>
+      <td>${o.report.estHours}h</td>
+      <td><span class="badge ${o.report.priority==='High'?'badge-red':o.report.priority==='Medium'?'badge-amber':'badge-blue'}">${o.report.priority||'Normal'}</span></td>
+      <td>${reportStatusBadge(o.status)}</td>
+      <td>${reportActionButtons(o, empId)}</td>
+    </tr>`).join('')}
+  </tbody></table></div>`;
+}
+
+function memberReportsCard(empId) {
+  if(!empId) return '';
+  const occ = getReportOccurrences(empId, STATE.currentYear, STATE.currentMonth);
+  const rs = getReportScore(empId, STATE.currentYear, STATE.currentMonth);
+  return `<div class="card" style="margin-top:20px">
+    <div class="card-header"><div>
+      <div class="card-title">My Regular Reports</div>
+      <div style="font-size:12px;color:var(--text3);margin-top:3px">${selectedMonthLabel()} · ${rs.due ? `${rs.done}/${rs.due} completed (${rs.onTime} on time, ${rs.late} late${rs.overdue?`, ${rs.overdue} overdue`:''})` : 'nothing counted yet'} · late submissions earn ${Math.round(REPORT_LATE_CREDIT*100)}% credit</div>
+    </div>${STATE.currentPage==='dashboard' ? `<button class="btn btn-secondary btn-sm" onclick="navigate('regular')">Open Regular Reports →</button>` : ''}</div>
+    ${reportOccurrencesTable(occ, empId)}
+  </div>`;
+}
+
+
+// ── Manager / admin: Team Report Tracker ────────────────────
+// Pending  = not closed and due today or earlier (Overdue / Due Today)
+// Upcoming = not closed and due after today
+// Closed   = completed (On Time or Late)
+function setTeamReportFilter(f) { STATE.reportTeamFilter = f; render(); }
+function setTeamReportEmp(id)   { STATE.reportTeamEmp = id; render(); }
+
+function teamReportsCard() {
+  if(isMember()) return '';
+  const y = STATE.currentYear, m = STATE.currentMonth, t = today();
+  const team = visibleEmployees().filter(e => e.status==='active' && e.id!==myEmpId());
+  const rows = [];
+  team.forEach(e => getReportOccurrences(e.id, y, m).forEach(o => rows.push({emp:e, o})));
+  const isClosed  = r => !!r.o.completion;
+  const isPending = r => !r.o.completion && r.o.dueDate <= t;
+  const isUpcoming= r => !r.o.completion && r.o.dueDate >  t;
+  const counts = {pending:rows.filter(isPending).length, upcoming:rows.filter(isUpcoming).length, closed:rows.filter(isClosed).length, all:rows.length};
+  const overdue = rows.filter(r=>r.o.status==='Overdue').length;
+  const late = rows.filter(r=>r.o.status==='Late').length;
+
+  const f = STATE.reportTeamFilter || 'pending';
+  const empSel = STATE.reportTeamEmp || '';
+  let shown = rows.filter(r => (empSel ? r.emp.id===empSel : true) &&
+    (f==='pending' ? isPending(r) : f==='upcoming' ? isUpcoming(r) : f==='closed' ? isClosed(r) : true));
+  shown.sort((a,b) => f==='closed'
+    ? (b.o.completion.completedAt||b.o.completion.completedDate).localeCompare(a.o.completion.completedAt||a.o.completion.completedDate)
+    : a.o.dueDate.localeCompare(b.o.dueDate) || a.emp.name.localeCompare(b.emp.name));
+
+  const tab = (key, label) => `<button class="btn ${f===key?'btn-primary':'btn-secondary'} btn-sm" onclick="setTeamReportFilter('${key}')">${label} (${counts[key]})</button>`;
+  return `<div class="card" style="margin:20px 0">
+    <div class="card-header" style="flex-wrap:wrap;gap:10px">
+      <div>
+        <div class="card-title">Team Report Tracker</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:3px">${selectedMonthLabel()} · ${team.length} team member${team.length!==1?'s':''} · ${overdue} overdue · ${late} closed late</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        ${tab('pending','Pending')}${tab('upcoming','Upcoming')}${tab('closed','Closed')}${tab('all','All')}
+        <select class="form-control" style="width:auto;padding:5px 8px;font-size:12px" onchange="setTeamReportEmp(this.value)">
+          <option value="">All employees</option>
+          ${team.map(e=>`<option value="${e.id}" ${empSel===e.id?'selected':''}>${escHtml(e.name)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    ${shown.length===0
+      ? `<div class="empty-state"><p>No ${f==='all'?'':f+' '}reports for ${selectedMonthLabel()}</p></div>`
+      : `<div class="table-wrap"><table><thead><tr><th>Employee</th><th>Report</th><th>Period</th><th>Due</th><th>Priority</th><th>Status</th><th>Action</th></tr></thead><tbody>
+        ${shown.map(({emp,o})=>`<tr>
+          <td><strong>${escHtml(emp.name)}</strong><br><small style="color:var(--text3)">${escHtml(emp.team||'')}</small></td>
+          <td><strong>${escHtml(o.report.name)}</strong><br><small style="color:var(--text3)">${reportDueLabel(o.report)}</small></td>
+          <td>${o.label}</td>
+          <td>${o.dueDate}</td>
+          <td><span class="badge ${o.report.priority==='High'?'badge-red':o.report.priority==='Medium'?'badge-amber':'badge-blue'}">${o.report.priority||'Normal'}</span></td>
+          <td>${reportStatusBadge(o.status)}</td>
+          <td>${reportActionButtons(o, emp.id)}</td>
+        </tr>`).join('')}
+      </tbody></table></div>`}
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════
 // BANDWIDTH ENGINE
 // ═══════════════════════════════════════════════════════════
 function getEmployeeBandwidth(empId, dateStr) {
@@ -643,7 +956,7 @@ function getEmployeeBandwidth(empId, dateStr) {
   let regHrs = 0;
   STATE.assignments.filter(a=>a.employeeId===empId).forEach(a=>{
     const rep = STATE.regularReports.find(r=>r.id===a.reportId);
-    if(rep && parseInt(rep.dueWorkingDay)===wdNum) regHrs += parseFloat(rep.estHours)||0;
+    if(rep && isReportDueOn(rep, dateStr, wdNum)) regHrs += parseFloat(rep.estHours)||0;
   });
 
   // Adhoc tasks assigned for this date
@@ -688,12 +1001,9 @@ function getPerformanceScore(empId, year, month) {
   const emp = STATE.employees.find(e=>e.id===empId);
   if(!emp) return 0;
 
-  // Regular reports completion (30%)
-  const myReps = STATE.assignments.filter(a=>a.employeeId===empId);
-  let regCompleted=0, regTotal=myReps.length * wds.length;
-  // Simplified: assume completed if no open adhoc delay flag
-  regCompleted = regTotal; // full credit by default unless quality hits
-  const regScore = regTotal>0 ? (regCompleted/regTotal)*100 : 100;
+  // Regular reports completion (30%) — per-occurrence: on time = full credit,
+  // late = partial credit, overdue = 0 (see REGULAR REPORT COMPLETION TRACKING)
+  const regScore = getReportScore(empId, year, month).score;
 
   // Adhoc tasks (20%)
   const myAdhoc = STATE.adhocTasks.filter(t=>t.assignedTo===empId && t.year===year && t.month===month);
@@ -798,6 +1108,7 @@ function dashboard() {
           </tr>`).join('')}
         </tbody></table></div>
       </div>` : ''}
+      ${memberReportsCard(myEmpId())}
       <div class="card" style="margin-top:20px">
         <div class="card-header"><div class="card-title">My Open Tasks</div>
           <button class="btn btn-primary btn-sm" onclick="navigate('adhoc')">View All Tasks</button>
@@ -827,6 +1138,9 @@ function dashboard() {
       ${kpiCard('Team Utilization', avgUtil+'%', 'Today', '#0EA5E9', '#E0F2FE', svgChart())}
       ${kpiCard('Available Hrs', totalAvail.toFixed(1)+'h', 'Team today', '#22C55E', '#DCFCE7', svgBattery())}
     </div>
+
+    ${myEmpId() ? memberReportsCard(myEmpId()) : ''}
+    ${teamReportsCard()}
 
     ${!isMember() ? (()=>{ const teamIds = visibleEmployees().map(e=>e.id); const pending = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && isTaskPendingAcceptance(t)); const responded = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && ['Accepted','Rejected'].includes(taskAssignmentLabel(t)) && t.responseAt).sort((a,b)=>new Date(b.responseAt)-new Date(a.responseAt)).slice(0,8); return `<div class="card" style="margin-bottom:20px;border:1px solid #E5E7EB"><div class="card-header"><div><div class="card-title">Ad Hoc Assignment Control</div><div style="font-size:12px;color:var(--text3);margin-top:3px">Track assignment requests and employee responses in one place.</div></div>${pending.length ? `<span class="badge badge-amber">${pending.length} Pending</span>` : '<span class="badge badge-green">No Pending Requests</span>'}</div>${pending.length ? `<div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Due</th><th>Response</th></tr></thead><tbody>${pending.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${t.dueDate||'—'}</td><td>${assignmentBadge(taskAssignmentLabel(t))}</td></tr>`}).join('')}</tbody></table></div>` : ''}${responded.length ? `<div style="padding:12px 16px 6px;font-size:12px;font-weight:700;color:var(--text2)">Recent Employee Responses</div><div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Response</th><th>When</th></tr></thead><tbody>${responded.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${assignmentBadge(taskAssignmentLabel(t))}${t.acceptedHours?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${t.acceptedHours}h · ${t.startDate||'—'} → ${t.expectedEndDate||'—'}</div>`:''}${t.responseComment?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${escHtml(t.responseComment)}</div>`:''}</td><td>${t.responseAt ? new Date(t.responseAt).toLocaleString() : '—'}</td></tr>`}).join('')}</tbody></table></div>` : ''}</div>`; })() : ''}
 
@@ -1426,6 +1740,7 @@ function deleteEmployee(id) {
   // Regular-report assignments only exist to link this employee to a
   // report — remove them entirely.
   STATE.assignments = STATE.assignments.filter(a=>a.employeeId!==id);
+  STATE.reportCompletions = STATE.reportCompletions.filter(c=>c.employeeId!==id);
 
   // Personal records that belong to this employee specifically — leaves,
   // quality reviews (manual + auto-generated from surveys), and survey
@@ -1510,7 +1825,7 @@ function viewEmployee(id) {
       <div class="tab" onclick="switchEmpTab('leaves','${id}')">Leave History</div>
     </div>
     <div id="emp-tab-content">
-      ${empReportsTab(myReps)}
+      ${empReportsTab(myReps, id)}
     </div>
   `, [{label:'Close', cls:'btn-secondary', fn:'closeModal()'}], true);
 }
@@ -1523,18 +1838,16 @@ function switchEmpTab(tab, empId) {
   const myAdhoc = STATE.adhocTasks.filter(t=>t.assignedTo===empId);
   const myLeaves = STATE.leaves.filter(l=>l.employeeId===empId).reverse();
   const tc = document.getElementById('emp-tab-content');
-  if(tab==='reports') tc.innerHTML = empReportsTab(myReps);
+  if(tab==='reports') tc.innerHTML = empReportsTab(myReps, empId);
   if(tab==='adhoc')   tc.innerHTML = empAdhocTab(myAdhoc);
   if(tab==='leaves')  tc.innerHTML = empLeavesTab(myLeaves);
 }
-function empReportsTab(reps) {
+function empReportsTab(reps, empId) {
   if(!reps.length) return `<div class="empty-state"><p>No regular reports assigned</p></div>`;
-  return `<div class="table-wrap"><table><thead><tr><th>Report</th><th>Due Day</th><th>Est Hours</th><th>Priority</th></tr></thead><tbody>
-    ${reps.map(r=>`<tr><td><strong>${r.name}</strong><br><small style="color:var(--text3)">${r.description||''}</small></td>
-      <td>Day ${r.dueWorkingDay}</td><td>${r.estHours}h</td>
-      <td><span class="badge ${r.priority==='High'?'badge-red':r.priority==='Medium'?'badge-amber':'badge-blue'}">${r.priority||'Normal'}</span></td>
-    </tr>`).join('')}
-  </tbody></table></div>`;
+  const y=STATE.currentYear, m=STATE.currentMonth;
+  const rs = getReportScore(empId, y, m);
+  return `<div style="font-size:12px;color:var(--text3);margin-bottom:10px">${selectedMonthLabel()} · Report score <strong style="color:var(--text)">${rs.score}%</strong>${rs.due ? ` · ${rs.onTime} on time, ${rs.late} late, ${rs.overdue} overdue` : ''}</div>`
+    + reportOccurrencesTable(getReportOccurrences(empId, y, m), empId);
 }
 function empAdhocTab(tasks) {
   if(!tasks.length) return `<div class="empty-state"><p>No adhoc tasks assigned</p></div>`;
@@ -1660,40 +1973,54 @@ function deleteLeave(id) {
 // ═══════════════════════════════════════════════════════════
 function regular() {
   const content = document.getElementById('content');
+  if(isMember()) {
+    content.innerHTML = `<div class="section-header"><h2>My Regular Reports</h2></div>` + (memberReportsCard(myEmpId()) || '<div class="empty-state"><p>No employee record linked to your login</p></div>');
+    return;
+  }
   content.innerHTML = `
     <div class="section-header">
-      <h2>Regular Reports</h2>
+      <div>
+        <h2>Regular Reports</h2>
+        ${isAdmin() ? `<div style="font-size:12px;color:var(--text3);margin-top:4px;display:flex;align-items:center;gap:6px">Completion tracking counts from
+          <input type="date" class="form-control" style="width:auto;padding:2px 6px;font-size:12px" value="${STATE.settings.reportTrackingStart||''}" onchange="setReportTrackingStart(this.value)"/></div>` : ''}
+      </div>
       <button class="btn btn-primary" onclick="openRegModal()">
         <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         Create Report
       </button>
     </div>
+    ${teamReportsCard()}
     <div class="card">
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Report Name</th><th>Description</th><th>Est Hours</th><th>Due Working Day</th>
-          <th>Priority</th><th>Criticality</th><th>Backup Owner</th><th>Assigned To</th><th>Actions</th>
+          <th>Report Name</th><th>Description</th><th>Est Hours</th><th>Schedule</th>
+          <th>Priority</th><th>Criticality</th><th>Backup Owner</th><th>Assigned To</th><th>${monthName(STATE.currentMonth)} Progress</th><th>Actions</th>
         </tr></thead>
         <tbody>
-          ${STATE.regularReports.length===0 ? `<tr><td colspan="9"><div class="empty-state"><p>No regular reports yet</p><small>Create recurring reports to assign to employees</small></div></td></tr>` :
+          ${STATE.regularReports.length===0 ? `<tr><td colspan="10"><div class="empty-state"><p>No regular reports yet</p><small>Create recurring reports to assign to employees</small></div></td></tr>` :
             STATE.regularReports.map(r=>{
               const assignees = STATE.assignments.filter(a=>a.reportId===r.id).map(a=>{
                 const e = STATE.employees.find(em=>em.id===a.employeeId);
                 return e ? `<div class="avatar" style="width:24px;height:24px;font-size:9px" data-tip="${e.name}">${initials(e.name)}</div>` : '';
               }).join('');
               const dueDate = nthWorkingDay(STATE.currentYear, STATE.currentMonth, parseInt(r.dueWorkingDay));
+              const progOcc = STATE.assignments.filter(a=>a.reportId===r.id).flatMap(a=>getReportOccurrences(a.employeeId, STATE.currentYear, STATE.currentMonth).filter(o=>o.report.id===r.id));
+              const progDone = progOcc.filter(o=>o.completion).length;
+              const progLate = progOcc.filter(o=>o.status==='Late').length;
+              const progOver = progOcc.filter(o=>o.status==='Overdue').length;
               return `<tr>
                 <td><strong>${r.name}</strong></td>
                 <td style="color:var(--text3);font-size:12px;max-width:200px">${r.description||'—'}</td>
                 <td style="font-weight:600">${r.estHours}h</td>
                 <td>
-                  <span class="badge badge-blue">Day ${r.dueWorkingDay}</span>
-                  <div style="font-size:11px;color:var(--text3);margin-top:2px">${dueDate||'—'}</div>
+                  <span class="badge badge-blue">${reportDueLabel(r)}</span>
+                  <div style="font-size:11px;color:var(--text3);margin-top:2px">${reportFreq(r)==='Weekly' ? 'Every week' : (dueDate||'—')}</div>
                 </td>
                 <td><span class="badge ${r.priority==='High'?'badge-red':r.priority==='Medium'?'badge-amber':'badge-blue'}">${r.priority||'Normal'}</span></td>
                 <td>${r.criticality||'—'}</td>
                 <td>${r.backupOwner||'—'}</td>
                 <td><div style="display:flex;gap:3px;flex-wrap:wrap">${assignees||'<span style="color:var(--text3);font-size:12px">Unassigned</span>'}</div></td>
+                <td>${progOcc.length ? `<strong>${progDone}/${progOcc.length}</strong> done${progLate?` <span class="badge badge-amber">${progLate} late</span>`:''}${progOver?` <span class="badge badge-red">${progOver} overdue</span>`:''}` : '<span style="color:var(--text3);font-size:12px">—</span>'}</td>
                 <td><div style="display:flex;gap:6px">
                   <button class="btn btn-secondary btn-sm" onclick="openRegModal('${r.id}')">Edit</button>
                   <button class="btn btn-danger btn-sm" onclick="deleteReg('${r.id}')">Delete</button>
@@ -1718,14 +2045,28 @@ function openRegModal(id) {
         <label class="form-label">Description</label>
         <textarea class="form-control" id="f-rdesc" placeholder="Brief description…">${rep?.description||''}</textarea>
       </div>
-      <div class="form-grid form-grid-3">
+      <div class="form-grid form-grid-2">
+        <div class="form-group">
+          <label class="form-label">Frequency *</label>
+          <select class="form-control" id="f-rfreq" onchange="toggleRegFreq()">
+            ${['Monthly','Weekly'].map(f=>`<option ${reportFreq(rep)===f?'selected':''}>${f}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-group" id="g-rday">
+          <label class="form-label">Due Working Day of Month *</label>
+          <input class="form-control" id="f-rday" type="number" min="1" max="25" placeholder="1" value="${rep?.dueWorkingDay||1}"/>
+        </div>
+        <div class="form-group" id="g-rweekday" style="display:none">
+          <label class="form-label">Due Weekday *</label>
+          <select class="form-control" id="f-rweekday">
+            ${[[1,'Monday'],[2,'Tuesday'],[3,'Wednesday'],[4,'Thursday'],[5,'Friday']].map(([v,n])=>`<option value="${v}" ${(parseInt(rep?.dueWeekday)||5)===v?'selected':''}>${n}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-grid form-grid-2">
         <div class="form-group">
           <label class="form-label">Estimated Hours *</label>
           <input class="form-control" id="f-rhrs" type="number" min="0.5" step="0.5" value="${rep?.estHours||1}"/>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Due Working Day *</label>
-          <input class="form-control" id="f-rday" type="number" min="1" max="25" placeholder="1" value="${rep?.dueWorkingDay||1}"/>
         </div>
         <div class="form-group">
           <label class="form-label">Priority</label>
@@ -1751,6 +2092,13 @@ function openRegModal(id) {
     {label:'Cancel', cls:'btn-secondary', fn:'closeModal()'},
     {label:rep?'Save Changes':'Create Report', cls:'btn-primary', fn:`saveReg('${id||''}')`}
   ]);
+  toggleRegFreq();
+}
+
+function toggleRegFreq() {
+  const weekly = document.getElementById('f-rfreq').value==='Weekly';
+  document.getElementById('g-rday').style.display = weekly ? 'none' : '';
+  document.getElementById('g-rweekday').style.display = weekly ? '' : 'none';
 }
 
 function saveReg(id) {
@@ -1758,7 +2106,9 @@ function saveReg(id) {
     name:         document.getElementById('f-rname').value.trim(),
     description:  document.getElementById('f-rdesc').value.trim(),
     estHours:     parseFloat(document.getElementById('f-rhrs').value)||1,
+    frequency:    document.getElementById('f-rfreq').value,
     dueWorkingDay:parseInt(document.getElementById('f-rday').value)||1,
+    dueWeekday:   parseInt(document.getElementById('f-rweekday').value)||5,
     priority:     document.getElementById('f-rprio').value,
     criticality:  document.getElementById('f-rcrit').value,
     backupOwner:  document.getElementById('f-rback').value.trim()
@@ -1779,6 +2129,7 @@ function deleteReg(id) {
   if(!confirm('Delete this report and all its assignments?')) return;
   STATE.regularReports = STATE.regularReports.filter(r=>r.id!==id);
   STATE.assignments = STATE.assignments.filter(a=>a.reportId!==id);
+  STATE.reportCompletions = STATE.reportCompletions.filter(c=>c.reportId!==id);
   save(); toast('Report deleted','info'); regular();
 }
 
@@ -3071,7 +3422,7 @@ function performance() {
           </div>
 
           <div style="font-size:12px;color:var(--text3);margin-bottom:8px">Score Breakdown</div>
-          ${scoreBar('Regular Reports (30%)', 100, 30, '#0B4EA2')}
+          ${scoreBar('Regular Reports (30%)', getReportScore(e.id,y,m).score, 30, '#0B4EA2')}
           ${scoreBar('Adhoc Tasks (20%)', myAdhoc.length?Math.round(adhocDone/myAdhoc.length*100):100, 20, '#0D9488')}
           ${scoreBar('Quality & Requestor Survey (35%)', qs, 35, '#F59E0B')}
           ${scoreBar('Utilization (10%)', bw.pct, 10, '#0EA5E9')}
@@ -3102,7 +3453,7 @@ function performance() {
                 <span style="font-weight:600">${e.name}</span>
               </div></td>
               <td>${e.team||'—'}</td>
-              <td>${STATE.assignments.filter(a=>a.employeeId===e.id).length} reports</td>
+              <td>${(()=>{ const rs=getReportScore(e.id,y,m); return rs.due ? `${rs.done}/${rs.due} done${rs.late?` <small style="color:var(--text3)">(${rs.late} late)</small>`:''}` : STATE.assignments.filter(a=>a.employeeId===e.id).length+' reports'; })()}</td>
               <td>${myA.filter(t=>t.status==='Completed').length}/${myA.length}</td>
               <td><span class="badge badge-blue">${qs}/100</span></td>
               <td>
@@ -3674,6 +4025,17 @@ function init() {
   const bootEl = document.getElementById('boot-loading');
 
   function beginSync() {
+    // Signed out on a cold load: RLS would return ZERO rows for the anon role,
+    // and the app would then treat that as "no data". So skip the read, show
+    // the login screen, and let onAuthStateChange load data after sign-in.
+    if(!_pendingAuthUser) {
+      console.log('[SUPABASE] No session — showing login; data loads after sign-in');
+      if(bootEl) bootEl.style.display = 'none';
+      setSyncStatus('connecting', 'Sign in to load data');
+      buildMonthPicker();
+      showLogin();
+      return;
+    }
     console.log('[SUPABASE] Auth ready — starting data sync');
     startSync(() => {
       // Fires once, after the initial bulk read of every row has arrived.
