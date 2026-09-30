@@ -1994,7 +1994,7 @@ function regular() {
       <div class="table-wrap"><table>
         <thead><tr>
           <th>Report Name</th><th>Description</th><th>Est Hours</th><th>Schedule</th>
-          <th>Priority</th><th>Criticality</th><th>Backup Owner</th><th>Assigned To</th><th>${monthName(STATE.currentMonth)} Progress</th><th>Actions</th>
+          <th>Priority</th><th>Report Owner</th><th>Backup Owner</th><th>Assigned To</th><th>${monthName(STATE.currentMonth)} Progress</th><th>Actions</th>
         </tr></thead>
         <tbody>
           ${STATE.regularReports.length===0 ? `<tr><td colspan="10"><div class="empty-state"><p>No regular reports yet</p><small>Create recurring reports to assign to employees</small></div></td></tr>` :
@@ -2017,8 +2017,8 @@ function regular() {
                   <div style="font-size:11px;color:var(--text3);margin-top:2px">${reportFreq(r)==='Weekly' ? 'Every week' : (dueDate||'—')}</div>
                 </td>
                 <td><span class="badge ${r.priority==='High'?'badge-red':r.priority==='Medium'?'badge-amber':'badge-blue'}">${r.priority||'Normal'}</span></td>
-                <td>${r.criticality||'—'}</td>
-                <td>${r.backupOwner||'—'}</td>
+                <td>${escHtml(r.owner||'—')}</td>
+                <td>${escHtml(r.backupOwner||'—')}</td>
                 <td><div style="display:flex;gap:3px;flex-wrap:wrap">${assignees||'<span style="color:var(--text3);font-size:12px">Unassigned</span>'}</div></td>
                 <td>${progOcc.length ? `<strong>${progDone}/${progOcc.length}</strong> done${progLate?` <span class="badge badge-amber">${progLate} late</span>`:''}${progOver?` <span class="badge badge-red">${progOver} overdue</span>`:''}` : '<span style="color:var(--text3);font-size:12px">—</span>'}</td>
                 <td><div style="display:flex;gap:6px">
@@ -2031,6 +2031,14 @@ function regular() {
       </table></div>
     </div>
   `;
+}
+
+// <option> list of every employee name (A–Z). Keeps a saved value that is no
+// longer in the employee list (e.g. legacy free-text backup owner) selectable.
+function empNameOptions(selected) {
+  const names = STATE.employees.map(e=>e.name).filter(Boolean).sort((a,b)=>a.localeCompare(b));
+  const list = (selected && !names.includes(selected)) ? [selected].concat(names) : names;
+  return `<option value="">— Select —</option>` + list.map(n=>`<option value="${escHtml(n)}" ${selected===n?'selected':''}>${escHtml(n)}</option>`).join('');
 }
 
 function openRegModal(id) {
@@ -2077,14 +2085,12 @@ function openRegModal(id) {
       </div>
       <div class="form-grid form-grid-2">
         <div class="form-group">
-          <label class="form-label">Business Criticality</label>
-          <select class="form-control" id="f-rcrit">
-            ${['Low','Medium','High','Critical'].map(c=>`<option ${rep?.criticality===c?'selected':''}>${c}</option>`).join('')}
-          </select>
+          <label class="form-label">Report Owner</label>
+          <select class="form-control" id="f-rowner">${empNameOptions(rep?.owner)}</select>
         </div>
         <div class="form-group">
           <label class="form-label">Backup Owner</label>
-          <input class="form-control" id="f-rback" placeholder="Backup person" value="${rep?.backupOwner||''}"/>
+          <select class="form-control" id="f-rback">${empNameOptions(rep?.backupOwner)}</select>
         </div>
       </div>
     </div>
@@ -2110,8 +2116,8 @@ function saveReg(id) {
     dueWorkingDay:parseInt(document.getElementById('f-rday').value)||1,
     dueWeekday:   parseInt(document.getElementById('f-rweekday').value)||5,
     priority:     document.getElementById('f-rprio').value,
-    criticality:  document.getElementById('f-rcrit').value,
-    backupOwner:  document.getElementById('f-rback').value.trim()
+    owner:        document.getElementById('f-rowner').value,
+    backupOwner:  document.getElementById('f-rback').value
   };
   if(!fields.name) { toast('Report name required','error'); return; }
   if(id) {
