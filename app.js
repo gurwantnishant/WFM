@@ -168,6 +168,8 @@ async function startSync(onReady) {
     console.error('[SUPABASE] Initial load failed:', err);
     setSyncStatus('error', err.message || String(err));
     toast('Could not load data from Supabase — check your connection', 'error');
+    showBootError('Could not load data from Supabase: ' + (err.message || err) +
+      '. Check your connection, that the Supabase project is not paused, and the workpulse_data table / RLS policies.');
     return; // deliberately do NOT call onReady()
   }
 
@@ -462,7 +464,10 @@ sb.auth.onAuthStateChange((event, session) => {
   console.log('[SUPABASE] Auth state ' + (isFirstReport ? 'ready' : 'changed') + ' (' + event + '):', user ? (user.email || user.id) : 'signed out');
   if(isFirstReport) {
     authReady = true;
-    if(_onAuthReadyCallback) { const cb = _onAuthReadyCallback; _onAuthReadyCallback = null; cb(); }
+    // setTimeout(0): beginSync() -> startSync() makes supabase requests. Running those
+    // INSIDE this auth callback deadlocks on supabase-js's internal auth lock whenever
+    // a saved session exists, leaving the page stuck on "Loading PWMS…" forever.
+    if(_onAuthReadyCallback) { const cb = _onAuthReadyCallback; _onAuthReadyCallback = null; setTimeout(cb, 0); }
   } else if(user && !_initialLoadDone) {
     // Signed in after a signed-out cold load (or after a logout): load the data
     // NOW, as the authenticated user. setTimeout(0) keeps supabase calls out of
@@ -4025,10 +4030,34 @@ function setSyncStatus(state, detail) {
 // Sync deliberately does NOT start until auth has reported at least once, so
 // it never races a Row Level Security check against an unresolved auth
 // token on a cold load.
+function showBootError(msg) {
+  const el = document.getElementById('boot-loading');
+  if(!el || el.style.display === 'none') return;
+  el.style.flexDirection = 'column';
+  el.style.gap = '14px';
+  el.style.padding = '24px';
+  el.style.textAlign = 'center';
+  el.style.color = '#B91C1C';
+  el.textContent = '';
+  const p = document.createElement('div');
+  p.textContent = msg;
+  const b = document.createElement('button');
+  b.textContent = 'Reload';
+  b.style.cssText = 'padding:8px 18px;border:0;border-radius:6px;background:#0B4EA2;color:#fff;font:600 13px system-ui,sans-serif;cursor:pointer';
+  b.onclick = () => location.reload();
+  el.append(p, b);
+}
+
 function init() {
   console.log('[SUPABASE] Initializing');
   setSyncStatus('connecting');
   const bootEl = document.getElementById('boot-loading');
+  // Watchdog: if startup hasn't finished in 15s, say so instead of spinning forever.
+  setTimeout(() => {
+    if(bootEl && bootEl.style.display !== 'none') {
+      showBootError('Startup is taking too long. Check your connection and that the Supabase project is active, then reload. (Details in the browser console, F12.)');
+    }
+  }, 15000);
 
   function beginSync() {
     // Signed out on a cold load: RLS would return ZERO rows for the anon role,
