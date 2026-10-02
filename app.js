@@ -115,7 +115,7 @@ const STATE = {
   leaves: [],
   regularReports: [],
   assignments: [],   // regular report assignments {id, reportId, employeeId, assignedDate}
-  reportCompletions: [], // per-occurrence completion log {id, reportId, employeeId, periodKey ('M:YYYY-MM' | 'W:<Monday YYYY-MM-DD>'), dueDate, completedDate, markedBy, note, createdAt}
+  reportCompletions: [], // per-occurrence completion log {id, reportId, employeeId, periodKey ('M:YYYY-MM' | 'W:<Monday YYYY-MM-DD>'), dueDate, completedDate, markedBy, note, createdAt, override?:{by,byEmpId,at,reason,originalCompletedDate}}
   adhocTasks: [],
   qualityReviews: [],
   surveyResponses: [], // {id, taskId, employeeId, satisfaction(1-5), onTime(bool), quality(1-5), comments, score(0-100), year, month, recordedAt}
@@ -791,9 +791,11 @@ function getReportOccurrences(empId, y, m) {
     if(!rep) return;
     reportPeriods(rep, y, m).forEach(p=>{
       const c = getReportCompletion(rep.id, empId, p.periodKey);
-      let status, credit = 0, counted = false;
+      let status, credit = 0, counted = false, overridden = false;
       if(c) {
         status = c.completedDate <= p.dueDate ? 'On Time' : 'Late';
+        // Manager/admin override: a late closure approved with an explanation counts as On Time
+        if(status==='Late' && c.override) { status = 'On Time'; overridden = true; }
         credit = status==='On Time' ? 1 : REPORT_LATE_CREDIT;
         counted = true;
       } else if(p.dueDate < t) {
@@ -803,7 +805,7 @@ function getReportOccurrences(empId, y, m) {
       } else {
         status = p.dueDate===t ? 'Due Today' : 'Upcoming';
       }
-      out.push({assignment:a, report:rep, periodKey:p.periodKey, label:p.label, dueDate:p.dueDate, completion:c, status, credit, counted});
+      out.push({assignment:a, report:rep, periodKey:p.periodKey, label:p.label, dueDate:p.dueDate, completion:c, status, credit, counted, overridden});
     });
   });
   return out.sort((a,b)=>a.dueDate.localeCompare(b.dueDate) || a.report.name.localeCompare(b.report.name));
@@ -822,6 +824,15 @@ function getReportScore(empId, y, m) {
 function reportStatusBadge(status) {
   const map = {'On Time':'badge-green','Late':'badge-amber','Overdue':'badge-red','Due Today':'badge-blue','Upcoming':'badge-gray','Not Tracked':'badge-gray'};
   return `<span class="badge ${map[status]||'badge-gray'}">${status}</span>`;
+}
+
+// Status badge plus, for manager-overridden reports, an "Overridden" tag with the explanation
+function reportStatusCell(o) {
+  if(!o.overridden) return reportStatusBadge(o.status);
+  const ov = o.completion.override;
+  const when = ov.at ? ov.at.slice(0,10) : '';
+  return `${reportStatusBadge(o.status)} <span class="badge badge-teal" title="Closed late on ${escHtml(ov.originalCompletedDate||o.completion.completedDate)}, changed to On Time by ${escHtml(ov.by||'a manager')}">Overridden</span>
+    <div style="font-size:11px;color:var(--text3);margin-top:4px;max-width:240px;white-space:normal">Reason: ${escHtml(ov.reason)}<br>— ${escHtml(ov.by||'')}${when?' · '+when:''}</div>`;
 }
 
 function canManageReportsFor(empId) {
@@ -878,6 +889,104 @@ function editReportCompletionDate(reportId, empId, periodKey, dueDate) {
   afterReportChange(empId);
 }
 
+// Manager/admin: a report closed after its due date can be changed to On Time
+// with a mandatory explanation. The late penalty is removed because scoring
+// treats the occurrence as On Time (see getReportOccurrences). Not allowed on
+// your own reports, so the approval always comes from someone else.
+function canOverrideReportFor(empId) {
+  return canManageReportsFor(empId) && empId !== myEmpId();
+}
+
+const OVERRIDE_MIN_REASON = 10;
+
+// Opens a small dialog of its own (not the shared modal), so the employee
+// profile popup stays open underneath when this is started from there.
+// The explanation is mandatory: Confirm stays disabled until it is filled in,
+// and saveReportOverride() re-checks it.
+function overrideReportToOnTime(reportId, empId, periodKey, dueDate) {
+  if(!canOverrideReportFor(empId)) { toast('Only the employee\'s manager or an admin can do this','error'); return; }
+  const c = getReportCompletion(reportId, empId, periodKey);
+  if(!c || c.completedDate <= dueDate) { toast('Only reports closed after the due date can be overridden','error'); return; }
+  const rep = STATE.regularReports.find(r=>r.id===reportId);
+  const emp = STATE.employees.find(e=>e.id===empId);
+  closeOverrideDialog();
+  const el = document.createElement('div');
+  el.id = 'ovr-dialog';
+  el.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;z-index:10000;padding:16px';
+  el.innerHTML = `
+    <div style="background:var(--surface);border-radius:12px;width:100%;max-width:460px;box-shadow:0 20px 50px rgba(0,0,0,.3)">
+      <div style="padding:16px 20px;border-bottom:1px solid var(--border)">
+        <div style="font-weight:700;font-size:15px">Change report to On Time</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:3px">${escHtml(rep?.name||'Report')} · ${escHtml(emp?.name||'')} · due ${escHtml(dueDate)}, closed ${escHtml(c.completedDate)}</div>
+      </div>
+      <div style="padding:16px 20px">
+        <div class="form-group">
+          <label style="font-size:12px;font-weight:600">Explanation <span style="color:#B91C1C">*</span></label>
+          <textarea id="ovr-reason" class="form-control" rows="4" maxlength="500" placeholder="Why should this count as On Time? (required)"></textarea>
+          <div id="ovr-hint" style="font-size:11px;color:var(--text3)">Required — at least ${OVERRIDE_MIN_REASON} characters. The employee will see this explanation.</div>
+        </div>
+      </div>
+      <div style="padding:12px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px">
+        <button class="btn btn-secondary" onclick="closeOverrideDialog()">Cancel</button>
+        <button class="btn btn-primary" id="ovr-confirm" disabled style="opacity:.5;cursor:not-allowed"
+          onclick="saveReportOverride('${reportId}','${empId}','${periodKey}','${dueDate}')">Confirm — mark On Time</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+  const ta = document.getElementById('ovr-reason');
+  ta.addEventListener('input', () => {
+    const ok = ta.value.trim().length >= OVERRIDE_MIN_REASON;
+    const btn = document.getElementById('ovr-confirm');
+    btn.disabled = !ok;
+    btn.style.opacity = ok ? '1' : '.5';
+    btn.style.cursor = ok ? 'pointer' : 'not-allowed';
+  });
+  ta.focus();
+}
+
+function closeOverrideDialog() {
+  const el = document.getElementById('ovr-dialog');
+  if(el) el.remove();
+}
+
+function saveReportOverride(reportId, empId, periodKey, dueDate) {
+  if(!canOverrideReportFor(empId)) { toast('Only the employee\'s manager or an admin can do this','error'); return; }
+  const c = getReportCompletion(reportId, empId, periodKey);
+  if(!c || c.completedDate <= dueDate) { closeOverrideDialog(); toast('Only reports closed after the due date can be overridden','error'); return; }
+  const reason = (document.getElementById('ovr-reason')?.value || '').trim();
+  if(reason.length < OVERRIDE_MIN_REASON) { toast('An explanation is required (at least '+OVERRIDE_MIN_REASON+' characters)','error'); return; }
+  const rep = STATE.regularReports.find(r=>r.id===reportId);
+  c.override = {by: STATE.currentUser?.name || '', byEmpId: myEmpId() || null, at: new Date().toISOString(), reason, originalCompletedDate: c.completedDate};
+  save();
+  addNotification({
+    type: 'report_override',
+    title: 'Report changed to On Time',
+    message: `${c.override.by||'Your manager'} changed "${rep?.name||'a report'}" (due ${dueDate}, closed ${c.completedDate}) from Late to On Time. No late penalty applies. Reason: ${reason}`,
+    forEmpId: empId
+  });
+  closeOverrideDialog();
+  toast('Changed to On Time — late penalty removed','success');
+  afterReportChange(empId);
+}
+
+function revokeReportOverride(reportId, empId, periodKey) {
+  if(!canOverrideReportFor(empId)) return;
+  const c = getReportCompletion(reportId, empId, periodKey);
+  if(!c || !c.override) return;
+  if(!confirm('Revoke this override? The report will go back to LATE with '+Math.round(REPORT_LATE_CREDIT*100)+'% credit.')) return;
+  const rep = STATE.regularReports.find(r=>r.id===reportId);
+  delete c.override;
+  save();
+  addNotification({
+    type: 'report_override_revoked',
+    title: 'On Time override revoked',
+    message: `${STATE.currentUser?.name||'Your manager'} revoked the On Time override on "${rep?.name||'a report'}" (due ${c.dueDate}). It is counted as Late again.`,
+    forEmpId: empId
+  });
+  toast('Override revoked','info');
+  afterReportChange(empId);
+}
+
 function undoReportCompletion(reportId, empId, periodKey) {
   const c = getReportCompletion(reportId, empId, periodKey);
   if(!c) return;
@@ -905,6 +1014,8 @@ function reportActionButtons(o, empId) {
   return `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
     <span style="font-size:11px;color:var(--text3)">Closed ${fmtCompletedAt(o.completion)}${o.completion.markedBy ? ' · by '+escHtml(o.completion.markedBy) : ''}</span>
     ${canManage ? `<button class="btn btn-secondary btn-sm" onclick="editReportCompletionDate(${args})">Edit date</button>` : ''}
+    ${canOverrideReportFor(empId) && o.status==='Late' ? `<button class="btn btn-primary btn-sm" onclick="overrideReportToOnTime(${args})">Mark On Time</button>` : ''}
+    ${canOverrideReportFor(empId) && o.overridden ? `<button class="btn btn-secondary btn-sm" onclick="revokeReportOverride('${o.report.id}','${empId}','${o.periodKey}')">Revoke override</button>` : ''}
     ${canUndo ? `<button class="btn btn-danger btn-sm" onclick="undoReportCompletion('${o.report.id}','${empId}','${o.periodKey}')">Undo</button>` : ''}
   </div>`;
 }
@@ -918,7 +1029,7 @@ function reportOccurrencesTable(occ, empId) {
       <td>${o.dueDate}</td>
       <td>${o.report.estHours}h</td>
       <td><span class="badge ${o.report.priority==='High'?'badge-red':o.report.priority==='Medium'?'badge-amber':'badge-blue'}">${o.report.priority||'Normal'}</span></td>
-      <td>${reportStatusBadge(o.status)}</td>
+      <td>${reportStatusCell(o)}</td>
       <td>${reportActionButtons(o, empId)}</td>
     </tr>`).join('')}
   </tbody></table></div>`;
@@ -990,7 +1101,7 @@ function teamReportsCard() {
           <td>${o.label}</td>
           <td>${o.dueDate}</td>
           <td><span class="badge ${o.report.priority==='High'?'badge-red':o.report.priority==='Medium'?'badge-amber':'badge-blue'}">${o.report.priority||'Normal'}</span></td>
-          <td>${reportStatusBadge(o.status)}</td>
+          <td>${reportStatusCell(o)}</td>
           <td>${reportActionButtons(o, emp.id)}</td>
         </tr>`).join('')}
       </tbody></table></div>`}
@@ -2693,13 +2804,14 @@ async function confirmAdhocAcceptance(id) {
 // Supabase like everything else in STATE, so any signed-in user
 // (not just the tab that triggered it) sees the same history.
 // ═══════════════════════════════════════════════════════════
-function addNotification({ type, title, message, taskId }) {
+function addNotification({ type, title, message, taskId, forEmpId }) {
   STATE.notifications.unshift({
     id: uid(),
     type,
     title,
     message,
     taskId: taskId || null,
+    forEmpId: forEmpId || null,   // when set, only that employee sees it
     read: false,
     createdAt: new Date().toISOString()
   });
@@ -2710,10 +2822,15 @@ function addNotification({ type, title, message, taskId }) {
   updateNotificationBadge();
 }
 
+// Notifications addressed to one employee (forEmpId) are visible only to them;
+// everything else stays visible to everyone, as before.
+function notificationVisible(n) { return !n.forEmpId || n.forEmpId === myEmpId(); }
+function visibleNotifications() { return STATE.notifications.filter(notificationVisible); }
+
 function updateNotificationBadge() {
   const el = document.getElementById('notif-badge');
   if(!el) return;
-  const unread = STATE.notifications.filter(n=>!n.read).length;
+  const unread = visibleNotifications().filter(n=>!n.read).length;
   if(unread > 0) {
     el.textContent = unread > 99 ? '99+' : String(unread);
     el.style.display = 'flex';
@@ -2733,7 +2850,7 @@ function notificationTimeAgo(iso) {
 }
 
 function openNotificationsPanel() {
-  const items = STATE.notifications.slice(0,50);
+  const items = visibleNotifications().slice(0,50);
   const body = items.length ? `
     <div style="display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto">
       ${items.map(n => `
@@ -2760,7 +2877,7 @@ function openNotificationsPanel() {
 
 function markAllNotificationsRead(opts) {
   const silent = opts && opts.silent;
-  STATE.notifications.forEach(n=>{ n.read = true; });
+  visibleNotifications().forEach(n=>{ n.read = true; });
   save();
   updateNotificationBadge();
   if(!silent) { toast('All notifications marked read','success'); closeModal(); }
