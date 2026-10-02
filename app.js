@@ -781,34 +781,124 @@ function getReportCompletion(reportId, empId, periodKey) {
   return STATE.reportCompletions.find(c=>c.reportId===reportId && c.employeeId===empId && c.periodKey===periodKey) || null;
 }
 
-// Every occurrence for an employee in a month, with status + credit
-function getReportOccurrences(empId, y, m) {
+// One occurrence (report + employee + period) with its status + credit.
+// Status is date-driven: closed → On Time / Late; not closed → Overdue once the
+// due date has passed, Due Today on the due date, Upcoming before it.
+function buildReportOccurrence(a, rep, p, empId) {
   const t = today();
   const start = STATE.settings.reportTrackingStart || '';
+  const c = getReportCompletion(rep.id, empId, p.periodKey);
+  let status, credit = 0, counted = false, overridden = false;
+  if(c) {
+    status = c.completedDate <= p.dueDate ? 'On Time' : 'Late';
+    // Manager/admin override: a late closure approved with an explanation counts as On Time
+    if(status==='Late' && c.override) { status = 'On Time'; overridden = true; }
+    credit = status==='On Time' ? 1 : REPORT_LATE_CREDIT;
+    counted = true;
+  } else if(p.dueDate < t) {
+    const inScope = (!start || p.dueDate >= start) && (!a.assignedDate || p.dueDate >= a.assignedDate);
+    status = inScope ? 'Overdue' : 'Not Tracked';
+    counted = inScope;
+  } else {
+    status = p.dueDate===t ? 'Due Today' : 'Upcoming';
+  }
+  return {assignment:a, report:rep, periodKey:p.periodKey, label:p.label, dueDate:p.dueDate, completion:c, status, credit, counted, overridden};
+}
+
+// Every occurrence for an employee in a month, with status + credit
+function getReportOccurrences(empId, y, m) {
   const out = [];
   STATE.assignments.filter(a=>a.employeeId===empId).forEach(a=>{
     const rep = STATE.regularReports.find(r=>r.id===a.reportId);
     if(!rep) return;
-    reportPeriods(rep, y, m).forEach(p=>{
-      const c = getReportCompletion(rep.id, empId, p.periodKey);
-      let status, credit = 0, counted = false, overridden = false;
-      if(c) {
-        status = c.completedDate <= p.dueDate ? 'On Time' : 'Late';
-        // Manager/admin override: a late closure approved with an explanation counts as On Time
-        if(status==='Late' && c.override) { status = 'On Time'; overridden = true; }
-        credit = status==='On Time' ? 1 : REPORT_LATE_CREDIT;
-        counted = true;
-      } else if(p.dueDate < t) {
-        const inScope = (!start || p.dueDate >= start) && (!a.assignedDate || p.dueDate >= a.assignedDate);
-        status = inScope ? 'Overdue' : 'Not Tracked';
-        counted = inScope;
-      } else {
-        status = p.dueDate===t ? 'Due Today' : 'Upcoming';
-      }
-      out.push({assignment:a, report:rep, periodKey:p.periodKey, label:p.label, dueDate:p.dueDate, completion:c, status, credit, counted, overridden});
-    });
+    reportPeriods(rep, y, m).forEach(p=> out.push(buildReportOccurrence(a, rep, p, empId)));
   });
   return out.sort((a,b)=>a.dueDate.localeCompare(b.dueDate) || a.report.name.localeCompare(b.report.name));
+}
+
+// The current week's (Mon–Fri) period of a weekly report, whatever month is selected
+function currentWeekPeriod(rep) {
+  const mon = mondayOf(today());
+  return {periodKey:'W:'+fmtDate(mon), label:'Week of '+shortDate(mon), dueDate: weeklyDueDate(rep, mon)};
+}
+
+// This week's occurrence of every weekly report assigned to an employee
+function getThisWeekOccurrences(empId) {
+  const out = [];
+  STATE.assignments.filter(a=>a.employeeId===empId).forEach(a=>{
+    const rep = STATE.regularReports.find(r=>r.id===a.reportId);
+    if(!rep || reportFreq(rep)!=='Weekly') return;
+    out.push(buildReportOccurrence(a, rep, currentWeekPeriod(rep), empId));
+  });
+  return out;
+}
+
+function dueDayLabel(dateStr) {
+  const d = parseDate(dateStr);
+  return WEEKDAY_SHORT[d.getDay()] + ' ' + shortDate(d);
+}
+function dueRelativeText(dateStr) {
+  const diff = Math.round((parseDate(dateStr) - parseDate(today())) / 86400000);
+  if(diff===0) return 'due today';
+  if(diff===1) return 'due tomorrow';
+  if(diff>1)   return 'due in '+diff+' days';
+  return Math.abs(diff)+' day'+(Math.abs(diff)===1?'':'s')+' overdue';
+}
+// Due cell: weekly reports show the weekday; open reports also show how far away / overdue
+function reportDueCell(o) {
+  const weekly = reportFreq(o.report)==='Weekly';
+  const open = !o.completion && o.status!=='Not Tracked';
+  return `${weekly ? dueDayLabel(o.dueDate)+' <small style="color:var(--text3)">('+o.dueDate+')</small>' : o.dueDate}`
+    + (open ? `<div style="font-size:11px;color:${o.status==='Overdue'?'#B91C1C':'var(--text3)'};margin-top:2px">${dueRelativeText(o.dueDate)}</div>` : '');
+}
+
+// Regular Reports page: this week's due date + status for a weekly report across its assignees
+function weeklyRowSummary(rep) {
+  const p = currentWeekPeriod(rep), t = today();
+  const occ = STATE.assignments.filter(a=>a.reportId===rep.id).map(a=>buildReportOccurrence(a, rep, p, a.employeeId)).filter(o=>o.status!=='Not Tracked');
+  const closed = occ.filter(o=>o.completion).length;
+  const open = occ.filter(o=>!o.completion);
+  let status;
+  if(open.some(o=>o.status==='Overdue')) status = 'Overdue';
+  else if(open.some(o=>o.status==='Due Today')) status = 'Due Today';
+  else if(open.length) status = 'Upcoming';
+  else if(occ.length) status = 'Closed';
+  else status = p.dueDate < t ? 'Overdue' : p.dueDate===t ? 'Due Today' : 'Upcoming';   // nobody assigned: date only
+  const badge = status==='Closed' ? '<span class="badge badge-green">All closed</span>' : reportStatusBadge(status);
+  return `<div style="font-size:11px;color:var(--text3);margin-top:2px">This week: <strong style="color:var(--text)">${dueDayLabel(p.dueDate)}</strong></div>
+    <div style="margin-top:3px">${badge}${occ.length ? ` <small style="color:var(--text3)">${closed}/${occ.length} closed</small>` : ''}</div>`;
+}
+
+// Dashboard: this week's weekly reports (current Mon–Fri) with weekday, date and live status
+function thisWeekReportsCard() {
+  const mon = mondayOf(today());
+  const fri = new Date(mon); fri.setDate(fri.getDate()+4);
+  const emps = isMember()
+    ? STATE.employees.filter(e=>e.id===myEmpId())
+    : visibleEmployees().filter(e=>e.status==='active');
+  const rank = {'Overdue':0,'Due Today':1,'Upcoming':2,'Late':3,'On Time':3};
+  const rows = [];
+  emps.forEach(e=>getThisWeekOccurrences(e.id).forEach(o=>{ if(o.status!=='Not Tracked') rows.push({emp:e,o}); }));
+  if(!rows.length) return '';
+  rows.sort((a,b)=>(rank[a.o.status]??4)-(rank[b.o.status]??4) || a.o.dueDate.localeCompare(b.o.dueDate) || a.emp.name.localeCompare(b.emp.name));
+  const n = st => rows.filter(r=>r.o.status===st).length;
+  const closed = rows.filter(r=>r.o.completion).length;
+  const showEmp = !isMember();
+  return `<div class="card" style="margin:20px 0">
+    <div class="card-header"><div>
+      <div class="card-title">This Week's Weekly Reports</div>
+      <div style="font-size:12px;color:var(--text3);margin-top:3px">${shortDate(mon)} – ${shortDate(fri)} · ${n('Overdue')} overdue · ${n('Due Today')} due today · ${n('Upcoming')} upcoming · ${closed} closed</div>
+    </div></div>
+    <div class="table-wrap"><table><thead><tr>${showEmp?'<th>Employee</th>':''}<th>Report</th><th>Due</th><th>Status</th><th>Action</th></tr></thead><tbody>
+      ${rows.map(({emp,o})=>`<tr>
+        ${showEmp?`<td><strong>${escHtml(emp.name)}</strong></td>`:''}
+        <td><strong>${escHtml(o.report.name)}</strong><br><small style="color:var(--text3)">${reportDueLabel(o.report)}</small></td>
+        <td>${reportDueCell(o)}</td>
+        <td>${reportStatusCell(o)}</td>
+        <td>${reportActionButtons(o, emp.id)}</td>
+      </tr>`).join('')}
+    </tbody></table></div>
+  </div>`;
 }
 
 function getReportScore(empId, y, m) {
@@ -1026,7 +1116,7 @@ function reportOccurrencesTable(occ, empId) {
     ${occ.map(o=>`<tr>
       <td><strong>${escHtml(o.report.name)}</strong><br><small style="color:var(--text3)">${reportDueLabel(o.report)}</small></td>
       <td>${o.label}</td>
-      <td>${o.dueDate}</td>
+      <td>${reportDueCell(o)}</td>
       <td>${o.report.estHours}h</td>
       <td><span class="badge ${o.report.priority==='High'?'badge-red':o.report.priority==='Medium'?'badge-amber':'badge-blue'}">${o.report.priority||'Normal'}</span></td>
       <td>${reportStatusCell(o)}</td>
@@ -1099,7 +1189,7 @@ function teamReportsCard() {
           <td><strong>${escHtml(emp.name)}</strong><br><small style="color:var(--text3)">${escHtml(emp.team||'')}</small></td>
           <td><strong>${escHtml(o.report.name)}</strong><br><small style="color:var(--text3)">${reportDueLabel(o.report)}</small></td>
           <td>${o.label}</td>
-          <td>${o.dueDate}</td>
+          <td>${reportDueCell(o)}</td>
           <td><span class="badge ${o.report.priority==='High'?'badge-red':o.report.priority==='Medium'?'badge-amber':'badge-blue'}">${o.report.priority||'Normal'}</span></td>
           <td>${reportStatusCell(o)}</td>
           <td>${reportActionButtons(o, emp.id)}</td>
@@ -1297,6 +1387,7 @@ function dashboard() {
           </tr>`).join('')}
         </tbody></table></div>
       </div>` : ''}
+      ${thisWeekReportsCard()}
       ${memberReportsCard(myEmpId())}
       <div class="card" style="margin-top:20px">
         <div class="card-header"><div class="card-title">My Open Tasks</div>
@@ -1329,6 +1420,7 @@ function dashboard() {
       ${kpiCard('Available Hrs', totalAvail.toFixed(1)+'h', 'Team today', '#22C55E', '#DCFCE7', svgBattery())}
     </div>
 
+    ${thisWeekReportsCard()}
     ${myEmpId() ? memberReportsCard(myEmpId()) : ''}
     ${teamReportsCard()}
 
@@ -2208,7 +2300,7 @@ function regular() {
                 <td style="font-weight:600">${r.estHours}h</td>
                 <td>
                   <span class="badge badge-blue">${reportDueLabel(r)}</span>
-                  <div style="font-size:11px;color:var(--text3);margin-top:2px">${reportFreq(r)==='Weekly' ? 'Every week' : (dueDate||'—')}</div>
+                  <div style="font-size:11px;color:var(--text3);margin-top:2px">${reportFreq(r)==='Weekly' ? '' : (dueDate||'—')}</div>${reportFreq(r)==='Weekly' ? weeklyRowSummary(r) : ''}
                 </td>
                 <td><span class="badge ${r.priority==='High'?'badge-red':r.priority==='Medium'?'badge-amber':'badge-blue'}">${r.priority||'Normal'}</span></td>
                 <td>${escHtml(r.owner||'—')}</td>
