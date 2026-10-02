@@ -745,13 +745,25 @@ function weeklyDueDate(rep, monday) {
   for(let i=0; i<7 && !isWorkingDay(d); i++) d.setDate(d.getDate()+1); // holiday → next working day
   return fmtDate(d);
 }
+// Monthly reports are due either on the Nth working day (default) or on the
+// first <weekday> of the month (e.g. first Friday). Both stay one-per-month.
+function reportMonthlyMode(rep) { return rep && rep.monthlyMode==='firstWeekday' ? 'firstWeekday' : 'workday'; }
+function firstWeekdayDueDate(rep, y, m) {
+  const wd = Math.min(5, Math.max(1, parseInt(rep.dueWeekday)||5));
+  const d = new Date(y, m, 1);
+  while(d.getDay() !== wd) d.setDate(d.getDate()+1);
+  for(let i=0; i<7 && !isWorkingDay(d); i++) d.setDate(d.getDate()+1);   // holiday → next working day
+  return fmtDate(d);
+}
 function isReportDueOn(rep, dateStr, wdNum) {
   if(reportFreq(rep)==='Weekly') return weeklyDueDate(rep, mondayOf(dateStr)) === dateStr;
+  if(reportMonthlyMode(rep)==='firstWeekday') { const d = parseDate(dateStr); return firstWeekdayDueDate(rep, d.getFullYear(), d.getMonth()) === dateStr; }
   return parseInt(rep.dueWorkingDay) === wdNum;
 }
 function reportDueLabel(rep) {
   return reportFreq(rep)==='Weekly'
     ? 'Weekly · ' + WEEKDAY_SHORT[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
+    : reportMonthlyMode(rep)==='firstWeekday' ? 'Monthly · First ' + WEEKDAY_FULL[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
     : 'Monthly · Day ' + (rep.dueWorkingDay||1);
 }
 
@@ -759,6 +771,7 @@ function reportDueLabel(rep) {
 function reportDueShort(rep) {
   return reportFreq(rep)==='Weekly'
     ? 'Weekly · ' + WEEKDAY_FULL[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
+    : reportMonthlyMode(rep)==='firstWeekday' ? 'First ' + WEEKDAY_FULL[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
     : 'Day ' + (rep.dueWorkingDay||1);
 }
 
@@ -780,7 +793,7 @@ function reportPeriods(rep, y, m) {
     const wds = getWorkingDays(y, m);
     if(!wds.length) return out;
     const n = parseInt(rep.dueWorkingDay) || 1;
-    out.push({periodKey:'M:'+y+'-'+String(m+1).padStart(2,'0'), label:monthName(m)+' '+y, dueDate: wds[n-1] || wds[wds.length-1]});
+    out.push({periodKey:'M:'+y+'-'+String(m+1).padStart(2,'0'), label:monthName(m)+' '+y, dueDate: reportMonthlyMode(rep)==='firstWeekday' ? firstWeekdayDueDate(rep, y, m) : (wds[n-1] || wds[wds.length-1])});
   }
   return out;
 }
@@ -854,7 +867,7 @@ function dueRelativeText(dateStr) {
 }
 // Due cell: weekly reports show the weekday; open reports also show how far away / overdue
 function reportDueCell(o) {
-  const weekly = reportFreq(o.report)==='Weekly';
+  const weekly = reportFreq(o.report)==='Weekly' || reportMonthlyMode(o.report)==='firstWeekday';
   const open = !o.completion && o.status!=='Not Tracked';
   return `${weekly ? dueDayLabel(o.dueDate)+' <small style="color:var(--text3)">('+o.dueDate+')</small>' : o.dueDate}`
     + (open ? `<div style="font-size:11px;color:${o.status==='Overdue'?'#B91C1C':'var(--text3)'};margin-top:2px">${dueRelativeText(o.dueDate)}</div>` : '');
@@ -2297,7 +2310,7 @@ function regular() {
                 const e = STATE.employees.find(em=>em.id===a.employeeId);
                 return e ? `<div class="avatar" style="width:24px;height:24px;font-size:9px" data-tip="${e.name}">${initials(e.name)}</div>` : '';
               }).join('');
-              const dueDate = nthWorkingDay(STATE.currentYear, STATE.currentMonth, parseInt(r.dueWorkingDay));
+              const dueDate = reportMonthlyMode(r)==='firstWeekday' ? dueDayLabel(firstWeekdayDueDate(r, STATE.currentYear, STATE.currentMonth)) : nthWorkingDay(STATE.currentYear, STATE.currentMonth, parseInt(r.dueWorkingDay));
               const progOcc = STATE.assignments.filter(a=>a.reportId===r.id).flatMap(a=>getReportOccurrences(a.employeeId, STATE.currentYear, STATE.currentMonth).filter(o=>o.report.id===r.id));
               const progDone = progOcc.filter(o=>o.completion).length;
               const progLate = progOcc.filter(o=>o.status==='Late').length;
@@ -2354,6 +2367,13 @@ function openRegModal(id) {
             ${['Monthly','Weekly'].map(f=>`<option ${reportFreq(rep)===f?'selected':''}>${f}</option>`).join('')}
           </select>
         </div>
+        <div class="form-group" id="g-rmode">
+          <label class="form-label">Monthly Due Date *</label>
+          <select class="form-control" id="f-rmode" onchange="toggleRegFreq()">
+            <option value="workday" ${reportMonthlyMode(rep)==='workday'?'selected':''}>Nth working day of the month</option>
+            <option value="firstWeekday" ${reportMonthlyMode(rep)==='firstWeekday'?'selected':''}>First weekday of the month (e.g. first Friday)</option>
+          </select>
+        </div>
         <div class="form-group" id="g-rday">
           <label class="form-label">Due Working Day of Month *</label>
           <input class="form-control" id="f-rday" type="number" min="1" max="25" placeholder="1" value="${rep?.dueWorkingDay||1}"/>
@@ -2397,8 +2417,10 @@ function openRegModal(id) {
 
 function toggleRegFreq() {
   const weekly = document.getElementById('f-rfreq').value==='Weekly';
-  document.getElementById('g-rday').style.display = weekly ? 'none' : '';
-  document.getElementById('g-rweekday').style.display = weekly ? '' : 'none';
+  const firstWd = !weekly && document.getElementById('f-rmode').value==='firstWeekday';
+  document.getElementById('g-rmode').style.display = weekly ? 'none' : '';
+  document.getElementById('g-rday').style.display = (weekly || firstWd) ? 'none' : '';
+  document.getElementById('g-rweekday').style.display = (weekly || firstWd) ? '' : 'none';
 }
 
 function saveReg(id) {
@@ -2407,6 +2429,7 @@ function saveReg(id) {
     description:  document.getElementById('f-rdesc').value.trim(),
     estHours:     parseFloat(document.getElementById('f-rhrs').value)||1,
     frequency:    document.getElementById('f-rfreq').value,
+    monthlyMode:  document.getElementById('f-rmode').value,
     dueWorkingDay:parseInt(document.getElementById('f-rday').value)||1,
     dueWeekday:   parseInt(document.getElementById('f-rweekday').value)||5,
     priority:     document.getElementById('f-rprio').value,
@@ -3616,7 +3639,7 @@ function onQualEmpChange() {
       opt.value = 'report:' + r.id;
       opt.dataset.dueDate = '';
       opt.dataset.completionDate = '';
-      opt.textContent = r.name + ' · ' + (reportFreq(r)==='Weekly' ? reportDueLabel(r) : 'WD' + (r.dueWorkingDay||1)) + ' · ' + r.estHours + 'h';
+      opt.textContent = r.name + ' · ' + ((reportFreq(r)==='Weekly' || reportMonthlyMode(r)==='firstWeekday') ? reportDueLabel(r) : 'WD' + (r.dueWorkingDay||1)) + ' · ' + r.estHours + 'h';
       grp.appendChild(opt);
     });
     taskSel.appendChild(grp);
