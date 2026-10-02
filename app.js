@@ -472,7 +472,7 @@ const PAGE_TITLES = {
 const PAGE_ACCESS = {
   admin:   ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','projects','quality','performance','holidays','skills','teams'],
   manager: ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','projects','quality','performance','holidays','skills','teams'],
-  member:  ['dashboard','regular','adhoc','performance']  // everything else shows locked
+  member:  ['dashboard','regular','adhoc','performance','projects']  // everything else shows locked
 };
 
 function showLogin() {
@@ -3892,7 +3892,56 @@ function countWorkingDaysBetween(startStr, endStr) {
   return n;
 }
 
+// Read-only page for members: only THEIR OWN assignments, and only Active + upcoming projects
+// (status Active and not yet past the end date). Shows name, dates, status and their own hours/day.
+function myProjects() {
+  const me = myEmpId(), t = today();
+  const mine = [];
+  STATE.projects.forEach(p => {
+    if((p.status||'Active') !== 'Active' || !p.endDate || p.endDate < t) return;
+    const a = (p.allocations||[]).find(x => x.employeeId === me);
+    if(a) mine.push({p, hoursPerDay: parseFloat(a.hoursPerDay)||0});
+  });
+  return mine.sort((x,y) => (x.p.startDate||'').localeCompare(y.p.startDate||''));
+}
+
+function projectsMemberView() {
+  const mine = myProjects(), t = today();
+  const hoursToday = getEmployeeBandwidth(myEmpId(), t).project || 0;
+  const upcoming = mine.filter(x => t < x.p.startDate).length;
+  document.getElementById('content').innerHTML = `
+    <div class="section-header"><h2>My Projects</h2></div>
+    <div class="alert alert-info" style="margin-bottom:20px">
+      These are the projects you've been assigned to. The hours per day below are included in your daily workload and reduce your available capacity on working days within each project's dates.
+    </div>
+    <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
+      ${kpiCard('Assigned Projects', mine.length, 'Active & upcoming', '#0B4EA2','#EEF2FF', svgChart())}
+      ${kpiCard('Project Hours Today', fmtH(hoursToday)+'h', 'Included in your workload', '#F59E0B','#FEF3C7', svgClock())}
+      ${kpiCard('Upcoming', upcoming, 'Not started yet', '#0D9488','#CCFBF1', svgFlash())}
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-title">Active &amp; Upcoming Projects</div></div>
+      ${mine.length === 0
+        ? `<div class="empty-state"><p>No active or upcoming projects assigned to you</p><small>When a manager assigns you to a project, it will appear here</small></div>`
+        : `<div class="table-wrap"><table>
+            <thead><tr><th>Project</th><th>Dates</th><th>Status</th><th>My hours/day</th></tr></thead>
+            <tbody>
+              ${mine.map(({p, hoursPerDay}) => {
+                const ph = projectPhase(p);
+                return `<tr>
+                  <td><strong>${escHtml(p.name)}</strong>${p.description ? `<div style="font-size:12px;color:var(--text3);max-width:320px">${escHtml(p.description)}</div>` : ''}</td>
+                  <td style="white-space:nowrap">${escHtml(p.startDate)} → ${escHtml(p.endDate)}<div style="font-size:12px;color:var(--text3)">${countWorkingDaysBetween(p.startDate, p.endDate)} working days</div></td>
+                  <td><span class="badge ${ph.cls}">${ph.label}</span></td>
+                  <td><strong>${fmtH(hoursPerDay)}h</strong></td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table></div>`}
+    </div>`;
+}
+
 function projects() {
+  if(isMember()) { projectsMemberView(); return; }
   const list = visibleProjects().slice().sort((a,b) => (b.startDate||'').localeCompare(a.startDate||''));
   const t = today();
   const running = list.filter(p => projectPhase(p).label === 'Running').length;
@@ -3950,6 +3999,7 @@ function projects() {
 }
 
 function openProjectModal(id) {
+  if(!(isAdmin() || isManager())) { toast('Only admins and managers can manage projects', 'error'); return; }
   const p = id ? STATE.projects.find(x => x.id === id) : null;
   const emps = eligibleProjectEmployees();
   const hoursOf = eid => { const a = ((p && p.allocations) || []).find(x => x.employeeId === eid); return a ? a.hoursPerDay : null; };
@@ -4001,6 +4051,7 @@ function openProjectModal(id) {
 }
 
 function saveProject(id) {
+  if(!(isAdmin() || isManager())) { toast('Only admins and managers can manage projects', 'error'); return; }
   const name = document.getElementById('f-pname').value.trim();
   const description = document.getElementById('f-pdesc').value.trim();
   const startDate = document.getElementById('f-pstart').value;
@@ -4038,6 +4089,7 @@ function saveProject(id) {
 }
 
 function deleteProject(id) {
+  if(!(isAdmin() || isManager())) { toast('Only admins and managers can manage projects', 'error'); return; }
   const p = STATE.projects.find(x => x.id === id);
   if(!p) return;
   if(!confirm(`Delete project "${p.name}"? Its planned hours will be removed from everyone's capacity.`)) return;
