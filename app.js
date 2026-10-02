@@ -716,6 +716,7 @@ function render() {
 // ═══════════════════════════════════════════════════════════
 const REPORT_LATE_CREDIT = 0.5;
 const WEEKDAY_SHORT = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const WEEKDAY_FULL = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 
 function ensureReportTrackingStart() {
   if(!STATE.settings.reportTrackingStart) {
@@ -752,6 +753,13 @@ function reportDueLabel(rep) {
   return reportFreq(rep)==='Weekly'
     ? 'Weekly · ' + WEEKDAY_SHORT[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
     : 'Monthly · Day ' + (rep.dueWorkingDay||1);
+}
+
+// Short due text for dropdowns: weekly → 'Fri' style weekday, monthly → 'Day N'
+function reportDueShort(rep) {
+  return reportFreq(rep)==='Weekly'
+    ? 'Weekly · ' + WEEKDAY_FULL[Math.min(5,Math.max(1,parseInt(rep.dueWeekday)||5))]
+    : 'Day ' + (rep.dueWorkingDay||1);
 }
 
 // All due periods of one report whose due date falls in the given month
@@ -3398,7 +3406,7 @@ function openAssignModal(empId) {
         <label class="form-label">Report *</label>
         <select class="form-control" id="f-arep">
           <option value="">— Select Report —</option>
-          ${unassigned().map(r=>`<option value="${r.id}">${r.name} (${r.estHours}h, Day ${r.dueWorkingDay})</option>`).join('')}
+          ${unassigned().map(r=>`<option value="${r.id}">${r.name} (${r.estHours}h, ${reportDueShort(r)})</option>`).join('')}
         </select>
       </div>
     </div>
@@ -3411,7 +3419,7 @@ function openAssignModal(empId) {
 function updateUnassignedReports() {
   const sel = document.getElementById('f-arep');
   const available = STATE.regularReports.filter(r=>!STATE.assignments.some(a=>a.reportId===r.id));
-  sel.innerHTML = `<option value="">— Select Report —</option>${available.map(r=>`<option value="${r.id}">${r.name} (${r.estHours}h, Day ${r.dueWorkingDay})</option>`).join('')}`;
+  sel.innerHTML = `<option value="">— Select Report —</option>${available.map(r=>`<option value="${r.id}">${r.name} (${r.estHours}h, ${reportDueShort(r)})</option>`).join('')}`;
 }
 
 function saveAssignment() {
@@ -3608,7 +3616,7 @@ function onQualEmpChange() {
       opt.value = 'report:' + r.id;
       opt.dataset.dueDate = '';
       opt.dataset.completionDate = '';
-      opt.textContent = r.name + ' · WD' + r.dueWorkingDay + ' · ' + r.estHours + 'h';
+      opt.textContent = r.name + ' · ' + (reportFreq(r)==='Weekly' ? reportDueLabel(r) : 'WD' + (r.dueWorkingDay||1)) + ' · ' + r.estHours + 'h';
       grp.appendChild(opt);
     });
     taskSel.appendChild(grp);
