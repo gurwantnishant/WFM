@@ -165,6 +165,8 @@ const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','repo
 const DATA_TABLE = 'workpulse_data';
 
 let _realtimeChannel = null;
+let _syncStarting = false;   // an initial load + subscribe is in flight
+let _syncWaiters = [];       // onReady callbacks from callers that arrived while it was in flight
 
 // ─── EXPLICIT LIFECYCLE FLAGS ───────────────────────────────
 // authReady      → kept as the audited flag name; here it means "Auth
@@ -208,7 +210,25 @@ function _applyRow(key, data) {
 // re-renders automatically from then on. Calls onReady() once the initial
 // load succeeds; never calls it on failure, so the app never renders on top
 // of a half-loaded STATE.
+// Removes this app's realtime channel (and any stale copy of it). supabase-js
+// returns the EXISTING channel when you ask for the same name again, and adding
+// postgres_changes callbacks to an already-subscribed channel throws — so a
+// second startSync() (auth events firing while the first load is still running,
+// or a quick logout/login before removeChannel finished) must never reuse it.
+async function _dropRealtimeChannels() {
+  const stale = (typeof sb.getChannels === 'function' ? sb.getChannels() : [])
+    .filter(ch => ch.topic === 'realtime:workpulse_data_sync');
+  if(_realtimeChannel && !stale.includes(_realtimeChannel)) stale.push(_realtimeChannel);
+  _realtimeChannel = null;
+  for(const ch of stale) { try { await sb.removeChannel(ch); } catch(e) { console.warn('[SUPABASE] removeChannel failed:', e); } }
+}
+
 async function startSync(onReady) {
+  // Already running → just report ready. Loading right now → queue behind it,
+  // so there is only ever one initial load and one realtime subscription.
+  if(_initialLoadDone) { onReady(); return; }
+  if(_syncStarting) { _syncWaiters.push(onReady); return; }
+  _syncStarting = true;
   console.log('[SUPABASE] Loading initial data');
   let rows;
   try {
@@ -224,6 +244,7 @@ async function startSync(onReady) {
     toast('Could not load data from Supabase — check your connection', 'error');
     showBootError('Could not load data from Supabase: ' + (err.message || err) +
       '. Check your connection, that the Supabase project is not paused, and the workpulse_data table / RLS policies.');
+    _syncStarting = false; _syncWaiters = [];
     return; // deliberately do NOT call onReady()
   }
 
@@ -238,6 +259,7 @@ async function startSync(onReady) {
   console.log('[SUPABASE] Initial data loaded:', rows.length, 'row(s)');
 
   console.log('[SUPABASE] Subscribing to realtime changes');
+  await _dropRealtimeChannels();
   _realtimeChannel = sb.channel('workpulse_data_sync')
     .on('postgres_changes', { event: '*', schema: 'public', table: DATA_TABLE }, payload => {
       const row = (payload.new && Object.keys(payload.new).length) ? payload.new : payload.old;
@@ -260,11 +282,15 @@ async function startSync(onReady) {
   _initialLoadDone = true;
   initialDataLoaded = true;
   isLoading = false;
+  _syncStarting = false;
+  const waiters = _syncWaiters; _syncWaiters = [];
   onReady();
+  waiters.forEach(fn => { try { fn(); } catch(e) { console.error(e); } });
 }
 
 function stopSync() {
-  if(_realtimeChannel) { sb.removeChannel(_realtimeChannel); _realtimeChannel = null; }
+  _dropRealtimeChannels();
+  _syncStarting = false; _syncWaiters = [];
   _initialLoadDone = false;
   initialDataLoaded = false;
   isLoading = true;
