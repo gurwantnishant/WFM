@@ -55,9 +55,63 @@ async function createEmployeeAuthAccount(email, password) {
   return data.user.id;
 }
 
+// ─── TIMEZONE: US EASTERN ───────────────────────────────────
+// The whole app runs on US Eastern time (America/New_York: EST in winter, EDT in
+// summer, switching automatically) no matter what timezone the user's device is in.
+// - "today", current month/year, month picker, late-vs-on-time checks all use nowET().
+// - Saved timestamps (createdAt / responseAt / completedAt) stay ISO-8601 UTC, which is
+//   unambiguous; they are converted to Eastern only when displayed (fmtTimeET).
+const APP_TZ = 'America/New_York';
+const _etFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: APP_TZ, hourCycle: 'h23',
+  year:'numeric', month:'2-digit', day:'2-digit',
+  hour:'2-digit', minute:'2-digit', second:'2-digit'
+});
+function _etParts(date) {
+  const p = {};
+  _etFormatter.formatToParts(date || new Date()).forEach(x => { p[x.type] = x.value; });
+  return p;
+}
+// Returns a Date whose LOCAL getters (getFullYear/getMonth/getDate/getDay/getHours…)
+// read the current US-Eastern wall-clock. Use it instead of `new Date()` for "now".
+function nowET() {
+  const p = _etParts();
+  return new Date(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+}
+// Live Eastern-time clock shown on the dashboard (confirms the app is on ET, not the device clock).
+const _etClockFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: APP_TZ, weekday:'short', year:'numeric', month:'short', day:'numeric',
+  hour:'numeric', minute:'2-digit', second:'2-digit', timeZoneName:'short'
+});
+function etClockText() {
+  const p = {};
+  _etClockFormatter.formatToParts(new Date()).forEach(x => { p[x.type] = x.value; });
+  return p.weekday + ', ' + p.month + ' ' + p.day + ', ' + p.year + ' · ' +
+         p.hour + ':' + p.minute + ':' + p.second + ' ' + (p.dayPeriod || '') + ' ' + p.timeZoneName;
+}
+function etClockHtml() {
+  return '<div style="display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--border);border-radius:999px;background:var(--surface);font-size:12px;color:var(--text2)" title="This app runs on US Eastern time, regardless of your device timezone">' +
+         '<span style="width:7px;height:7px;border-radius:50%;background:var(--green)"></span>' +
+         '<strong id="et-clock">' + etClockText() + '</strong></div>';
+}
+function updateETClock() { const el = document.getElementById('et-clock'); if(el) el.textContent = etClockText(); }
+setInterval(updateETClock, 1000);
+
+// "YYYY-MM-DD HH:mm ET" for an ISO timestamp (replaces toLocaleString(), which used the device timezone).
+function fmtDateTimeET(iso) {
+  const p = _etParts(new Date(iso));
+  return p.year + '-' + p.month + '-' + p.day + ' ' + String((+p.hour) % 24).padStart(2,'0') + ':' + p.minute + ' ET';
+}
+// "HH:mm" in US Eastern for an ISO timestamp.
+function fmtTimeET(iso) {
+  const p = _etParts(new Date(iso));
+  return String((+p.hour) % 24).padStart(2,'0') + ':' + p.minute;
+}
+
 // ─── STATE ─────────────────────────────────────────────────
 const STATE = {
   employees: [],
+  projects: [], // {id,name,description,startDate,endDate,status('Active'|'On Hold'|'Completed'),allocations:[{employeeId,hoursPerDay}],createdAt,createdBy}
   leaves: [],
   regularReports: [],
   assignments: [],   // regular report assignments {id, reportId, employeeId, assignedDate}
@@ -69,8 +123,8 @@ const STATE = {
   skills: [],        // {id, name, category, description}
   teams: [],         // {id, name, manager}
   currentUser: null, // {role:'admin'|'manager'|'member', empId, name}
-  currentMonth: new Date().getMonth(),
-  currentYear: new Date().getFullYear(),
+  currentMonth: nowET().getMonth(),
+  currentYear: nowET().getFullYear(),
   currentPage: 'dashboard',
   reportTeamFilter: 'pending', reportTeamEmp: '', // UI-only filters for the manager Team Report Tracker
   showCompletedAdhoc: false, // UI-only toggle for Adhoc Tasks table, not persisted
@@ -107,7 +161,7 @@ const STATE = {
 //   create policy "Authenticated can update" on workpulse_data for update using (auth.role() = 'authenticated');
 //   alter publication supabase_realtime add table workpulse_data;  -- enables realtime for this table
 //
-const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','reportCompletions','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','notifications'];
+const DATA_DOC_KEYS = ['employees','leaves','regularReports','assignments','reportCompletions','adhocTasks','qualityReviews','surveyResponses','holidays','skills','teams','notifications','projects'];
 const DATA_TABLE = 'workpulse_data';
 
 let _realtimeChannel = null;
@@ -296,12 +350,13 @@ function escHtml(s) { return String(s==null?'':s).replace(/&/g,'&amp;').replace(
 // Escapes text for safe placement inside a single-quoted JS string literal that
 // itself sits inside a double-quoted HTML attribute (e.g. onclick="fn('${x}')").
 function escJsAttr(s) { return String(s==null?'':s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
-function today() { return fmtDate(new Date()); }
+function today() { return fmtDate(nowET()); }
+function fmtH(n) { return String(+(parseFloat(n)||0).toFixed(2)); } // 1 -> '1', 1.5 -> '1.5'
 function fmtDate(d) {
-  const dt = d instanceof Date ? d : new Date(d);
+  const dt = d instanceof Date ? d : parseDate(d);
   return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
-function parseDate(s) { return new Date(s + 'T00:00:00'); }
+function parseDate(s) { return new Date(String(s).slice(0,10) + 'T00:00:00'); }
 function daysInMonth(y,m) { return new Date(y, m+1, 0).getDate(); }
 function isWeekend(d) { const day=d.getDay(); return day===0||day===6; }
 function isHoliday(dateStr) { return STATE.holidays.some(h=>h.date===dateStr); }
@@ -357,7 +412,7 @@ function selectedMonthLabel() {
 function buildMonthPicker() {
   const sel = document.getElementById('month-select');
   sel.innerHTML = '';
-  const now = new Date();
+  const now = nowET();
   for(let offset=-6; offset<=6; offset++){
     let d = new Date(now.getFullYear(), now.getMonth()+offset, 1);
     const opt = document.createElement('option');
@@ -392,7 +447,8 @@ const PAGE_TITLES = {
   assignments:'Assignments', quality:'Quality Management',
   performance:'Performance', holidays:'Holiday Calendar',
   skills:'Skills Library',
-  teams:'Teams & Managers'
+  teams:'Teams & Managers',
+  projects:'Projects'
 };
 // ═══════════════════════════════════════════════════════════
 // AUTH SYSTEM
@@ -414,8 +470,8 @@ const PAGE_TITLES = {
 
 // Pages fully accessible by role
 const PAGE_ACCESS = {
-  admin:   ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','quality','performance','holidays','skills','teams'],
-  manager: ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','quality','performance','holidays','skills','teams'],
+  admin:   ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','projects','quality','performance','holidays','skills','teams'],
+  manager: ['dashboard','capacity','employees','leaves','regular','adhoc','assignments','projects','quality','performance','holidays','skills','teams'],
   member:  ['dashboard','regular','adhoc','performance']  // everything else shows locked
 };
 
@@ -640,7 +696,7 @@ function render() {
   const pages = {
     dashboard, capacity, employees, leaves,
     regular, adhoc, assignments, quality,
-    performance, holidays, skills, teams
+    performance, holidays, skills, teams, projects
   };
   const fn = pages[STATE.currentPage];
   if(fn) fn();
@@ -835,8 +891,7 @@ function undoReportCompletion(reportId, empId, periodKey) {
 
 function fmtCompletedAt(c) {
   if(!c.completedAt) return c.completedDate;
-  const d = new Date(c.completedAt);
-  return c.completedDate + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  return c.completedDate + ' ' + fmtTimeET(c.completedAt) + ' ET';
 }
 
 function reportActionButtons(o, empId) {
@@ -945,14 +1000,29 @@ function teamReportsCard() {
 // ═══════════════════════════════════════════════════════════
 // BANDWIDTH ENGINE
 // ═══════════════════════════════════════════════════════════
+// Planned project hours for one employee on one date. Counts only Active projects whose
+// start..end range (inclusive) contains the date, and only on working days (not weekends/holidays).
+function getProjectHours(empId, dateStr) {
+  if(!STATE.projects.length) return 0;
+  const d = parseDate(dateStr);
+  if(isNaN(d) || !isWorkingDay(d)) return 0;
+  let h = 0;
+  STATE.projects.forEach(p => {
+    if((p.status||'Active') !== 'Active') return;
+    if(!p.startDate || !p.endDate || dateStr < p.startDate || dateStr > p.endDate) return;
+    (p.allocations||[]).forEach(a => { if(a.employeeId === empId) h += parseFloat(a.hoursPerDay)||0; });
+  });
+  return h;
+}
+
 function getEmployeeBandwidth(empId, dateStr) {
   const emp = STATE.employees.find(e=>e.id===empId);
-  if(!emp || emp.status==='inactive') return {total:0, regular:0, adhoc:0, leave:0, available:0, pct:100};
+  if(!emp || emp.status==='inactive') return {total:0, regular:0, adhoc:0, project:0, leave:0, available:0, pct:100};
   const total = parseFloat(emp.loginHours)||8;
 
   // Leave check
   const onLeave = STATE.leaves.some(l=>l.employeeId===empId && l.date===dateStr);
-  if(onLeave) return {total, regular:0, adhoc:0, leave:total, available:0, pct:100};
+  if(onLeave) return {total, regular:0, adhoc:0, project:0, leave:total, available:0, pct:100};
 
   // Regular reports due this working day
   const wds = getWorkingDays(STATE.currentYear, STATE.currentMonth);
@@ -969,10 +1039,13 @@ function getEmployeeBandwidth(empId, dateStr) {
   STATE.adhocTasks.filter(t=>t.assignedTo===empId && t.assignedDate===dateStr && !['Completed','Cancelled'].includes(t.status))
     .forEach(t=>{ adhocHrs += parseFloat(t.estHours)||0; });
 
-  const used = Math.min(regHrs+adhocHrs, total);
+  // Project hours: fixed planned hours/day for every working day inside an Active project's date range
+  const projHrs = getProjectHours(empId, dateStr);
+
+  const used = Math.min(regHrs+adhocHrs+projHrs, total);
   const available = Math.max(0, total - used);
   const pct = Math.round((used/total)*100);
-  return {total, regular:regHrs, adhoc:adhocHrs, leave:0, available, pct};
+  return {total, regular:regHrs, adhoc:adhocHrs, project:projHrs, leave:0, available, pct};
 }
 
 function getMonthBandwidth(empId) {
@@ -1027,7 +1100,7 @@ function getPerformanceScore(empId, year, month) {
   const utilScore = Math.min(100, avgUtil<50 ? avgUtil*1.5 : avgUtil>95 ? 85 : 100);
 
   // Attendance (5%)
-  const leaves = STATE.leaves.filter(l=>l.employeeId===empId && new Date(l.date).getFullYear()===year && new Date(l.date).getMonth()===month);
+  const leaves = STATE.leaves.filter(l=>l.employeeId===empId && parseDate(l.date).getFullYear()===year && parseDate(l.date).getMonth()===month);
   const unplanned = leaves.filter(l=>l.type==='Unplanned').length;
   const attScore = Math.max(0, 100 - unplanned*15);
 
@@ -1055,7 +1128,7 @@ function dashboard() {
   const totalReg = STATE.regularReports.length;
   const visEmpIds = visibleEmployees().map(e=>e.id);
   const totalAdhoc = STATE.adhocTasks.filter(t=>{
-    const d=new Date(t.assignedDate||t.createdAt||'');
+    const d=parseDate(t.assignedDate||t.createdAt||'');
     return d.getFullYear()===y && d.getMonth()===m
       && (isAdmin() || (t.assignedTo && visEmpIds.includes(t.assignedTo)));
   }).length;
@@ -1094,7 +1167,7 @@ function dashboard() {
     const perfScore = me ? getPerformanceScore(me.id, y, m) : 0;
     const qualScore = me ? getQualityScore(me.id, y, m) : 100;
     content.innerHTML = `
-      <div class="section-header"><h2>My Dashboard</h2></div>
+      <div class="section-header"><h2>My Dashboard</h2>${etClockHtml()}</div>
       <div class="kpi-grid" style="grid-template-columns:repeat(4,1fr)">
         ${kpiCard('Performance', perfScore, selectedMonthLabel(), '#0B4EA2','#EEF2FF', svgFlash())}
         ${kpiCard('Quality Score', qualScore, selectedMonthLabel(), '#0D9488','#CCFBF1', svgStar())}
@@ -1134,6 +1207,7 @@ function dashboard() {
   }
 
   content.innerHTML = `
+    <div style="display:flex;justify-content:flex-end;margin-bottom:14px">${etClockHtml()}</div>
     <div class="kpi-grid">
       ${kpiCard('Total Employees', totalEmps, 'Active team members', '#0B4EA2', '#EEF2FF', svgPeople())}
       ${kpiCard('Regular Reports', totalReg, 'Recurring reports', '#0D9488', '#CCFBF1', svgDoc())}
@@ -1147,7 +1221,7 @@ function dashboard() {
     ${myEmpId() ? memberReportsCard(myEmpId()) : ''}
     ${teamReportsCard()}
 
-    ${!isMember() ? (()=>{ const teamIds = visibleEmployees().map(e=>e.id); const pending = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && isTaskPendingAcceptance(t)); const responded = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && ['Accepted','Rejected'].includes(taskAssignmentLabel(t)) && t.responseAt).sort((a,b)=>new Date(b.responseAt)-new Date(a.responseAt)).slice(0,8); return `<div class="card" style="margin-bottom:20px;border:1px solid #E5E7EB"><div class="card-header"><div><div class="card-title">Ad Hoc Assignment Control</div><div style="font-size:12px;color:var(--text3);margin-top:3px">Track assignment requests and employee responses in one place.</div></div>${pending.length ? `<span class="badge badge-amber">${pending.length} Pending</span>` : '<span class="badge badge-green">No Pending Requests</span>'}</div>${pending.length ? `<div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Due</th><th>Response</th></tr></thead><tbody>${pending.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${t.dueDate||'—'}</td><td>${assignmentBadge(taskAssignmentLabel(t))}</td></tr>`}).join('')}</tbody></table></div>` : ''}${responded.length ? `<div style="padding:12px 16px 6px;font-size:12px;font-weight:700;color:var(--text2)">Recent Employee Responses</div><div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Response</th><th>When</th></tr></thead><tbody>${responded.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${assignmentBadge(taskAssignmentLabel(t))}${t.acceptedHours?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${t.acceptedHours}h · ${t.startDate||'—'} → ${t.expectedEndDate||'—'}</div>`:''}${t.responseComment?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${escHtml(t.responseComment)}</div>`:''}</td><td>${t.responseAt ? new Date(t.responseAt).toLocaleString() : '—'}</td></tr>`}).join('')}</tbody></table></div>` : ''}</div>`; })() : ''}
+    ${!isMember() ? (()=>{ const teamIds = visibleEmployees().map(e=>e.id); const pending = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && isTaskPendingAcceptance(t)); const responded = STATE.adhocTasks.filter(t=>teamIds.includes(t.assignedTo) && ['Accepted','Rejected'].includes(taskAssignmentLabel(t)) && t.responseAt).sort((a,b)=>new Date(b.responseAt)-new Date(a.responseAt)).slice(0,8); return `<div class="card" style="margin-bottom:20px;border:1px solid #E5E7EB"><div class="card-header"><div><div class="card-title">Ad Hoc Assignment Control</div><div style="font-size:12px;color:var(--text3);margin-top:3px">Track assignment requests and employee responses in one place.</div></div>${pending.length ? `<span class="badge badge-amber">${pending.length} Pending</span>` : '<span class="badge badge-green">No Pending Requests</span>'}</div>${pending.length ? `<div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Due</th><th>Response</th></tr></thead><tbody>${pending.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${t.dueDate||'—'}</td><td>${assignmentBadge(taskAssignmentLabel(t))}</td></tr>`}).join('')}</tbody></table></div>` : ''}${responded.length ? `<div style="padding:12px 16px 6px;font-size:12px;font-weight:700;color:var(--text2)">Recent Employee Responses</div><div class="table-wrap"><table><thead><tr><th>Task</th><th>Employee</th><th>Sales Org</th><th>Response</th><th>When</th></tr></thead><tbody>${responded.map(t=>{const e=STATE.employees.find(x=>x.id===t.assignedTo); return `<tr><td><strong>${escHtml(t.name)}</strong></td><td>${escHtml(e?.name||'—')}</td><td><span class="badge badge-teal">${escHtml(t.salesOrg||'—')}</span></td><td>${assignmentBadge(taskAssignmentLabel(t))}${t.acceptedHours?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${t.acceptedHours}h · ${t.startDate||'—'} → ${t.expectedEndDate||'—'}</div>`:''}${t.responseComment?`<div style="font-size:11px;color:var(--text3);margin-top:3px">${escHtml(t.responseComment)}</div>`:''}</td><td>${t.responseAt ? fmtDateTimeET(t.responseAt) : '—'}</td></tr>`}).join('')}</tbody></table></div>` : ''}</div>`; })() : ''}
 
     <div class="charts-grid">
       <div class="card">
@@ -1275,7 +1349,7 @@ function buildSplitChart(emps, y, m) {
   if(!ctx) return;
   const regAssigned = STATE.assignments.length;
   const adhocCount = STATE.adhocTasks.filter(t=>{
-    const d=new Date(t.assignedDate||'');
+    const d=parseDate(t.assignedDate||'');
     return d.getFullYear()===y && d.getMonth()===m;
   }).length;
   STATE.charts['split'] = new Chart(ctx, {
@@ -1292,8 +1366,8 @@ function buildLeaveChart(emps, y, m) {
   const ctx = document.getElementById('ch-leave');
   if(!ctx) return;
   const empNames = emps.slice(0,8).map(e=>e.name.split(' ')[0]);
-  const planned = emps.slice(0,8).map(e=>STATE.leaves.filter(l=>l.employeeId===e.id&&l.type==='Planned'&&new Date(l.date).getFullYear()===y&&new Date(l.date).getMonth()===m).length);
-  const unplanned = emps.slice(0,8).map(e=>STATE.leaves.filter(l=>l.employeeId===e.id&&l.type==='Unplanned'&&new Date(l.date).getFullYear()===y&&new Date(l.date).getMonth()===m).length);
+  const planned = emps.slice(0,8).map(e=>STATE.leaves.filter(l=>l.employeeId===e.id&&l.type==='Planned'&&parseDate(l.date).getFullYear()===y&&parseDate(l.date).getMonth()===m).length);
+  const unplanned = emps.slice(0,8).map(e=>STATE.leaves.filter(l=>l.employeeId===e.id&&l.type==='Unplanned'&&parseDate(l.date).getFullYear()===y&&parseDate(l.date).getMonth()===m).length);
   STATE.charts['leave'] = new Chart(ctx, {
     type:'bar',
     data:{labels:empNames,datasets:[
@@ -1359,7 +1433,7 @@ function capacity() {
                   const bw = getEmployeeBandwidth(e.id, d.date);
                   const cls = bw.pct===100&&bw.leave>0 ? 'cal-gray' : calColor(bw.pct);
                   const isToday = d.date===today();
-                  return `<td style="text-align:center"><div class="cal-cell ${cls}${isToday?' cal-today':''}" style="width:30px;margin:auto" data-tip="${bw.pct}% used">${bw.available.toFixed(0)}h</div></td>`;
+                  return `<td style="text-align:center"><div class="cal-cell ${cls}${isToday?' cal-today':''}" style="width:30px;margin:auto" data-tip="${bw.pct}% used · Reg ${fmtH(bw.regular)}h · Adhoc ${fmtH(bw.adhoc)}h · Project ${fmtH(bw.project)}h">${bw.available.toFixed(0)}h</div></td>`;
                 }).join('')}
               </tr>`).join('')}
           </tbody>
@@ -1372,6 +1446,7 @@ function capacity() {
         const bwList = getMonthBandwidth(e.id);
         const avgUtil = bwList.length ? Math.round(bwList.reduce((s,b)=>s+b.pct,0)/bwList.length) : 0;
         const totalAvail = bwList.reduce((s,b)=>s+b.available,0);
+        const projMonth = bwList.reduce((s,b)=>s+(b.project||0),0);
         return `<div class="card">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
             <div class="avatar">${initials(e.name)}</div>
@@ -1386,6 +1461,9 @@ function capacity() {
               <div style="color:var(--text3)">Total Available</div>
               <div style="font-weight:700;font-size:16px;color:var(--teal)">${totalAvail.toFixed(1)}h</div>
             </div>
+          </div>
+          <div style="margin-top:8px;font-size:12px;background:var(--surface2);padding:8px;border-radius:8px;display:flex;justify-content:space-between">
+            <span style="color:var(--text3)">Project hours this month</span><strong>${fmtH(projMonth)}h</strong>
           </div>
         </div>`;
       }).join('')}
@@ -1876,7 +1954,7 @@ function empLeavesTab(leaves) {
 function leaves() {
   const y=STATE.currentYear, m=STATE.currentMonth;
   const visEmpIds = visibleEmployees().map(e=>e.id);
-  const monthLeaves = STATE.leaves.filter(l=>{ const d=new Date(l.date); return d.getFullYear()===y&&d.getMonth()===m && visEmpIds.includes(l.employeeId); });
+  const monthLeaves = STATE.leaves.filter(l=>{ const d=parseDate(l.date); return d.getFullYear()===y&&d.getMonth()===m && visEmpIds.includes(l.employeeId); });
   const planned = monthLeaves.filter(l=>l.type==='Planned');
   const unplanned = monthLeaves.filter(l=>l.type==='Unplanned');
   const todayStr = today();
@@ -2151,7 +2229,7 @@ function adhoc() {
   const y=STATE.currentYear, m=STATE.currentMonth;
   const u = STATE.currentUser;
   const monthTasks = STATE.adhocTasks.filter(t=>{
-    const d=new Date(t.assignedDate||t.createdAt||'');
+    const d=parseDate(t.assignedDate||t.createdAt||'');
     const inMonth = d.getFullYear()===y && d.getMonth()===m;
     if(!inMonth) return false;
     if(isMember()) return t.assignedTo === myEmpId();  // member sees only own
@@ -3346,8 +3424,8 @@ function onQualTaskChange() {
   const completionDate = selected.dataset.completionDate;
 
   if(dueDate) {
-    const due = new Date(dueDate);
-    const completed = completionDate ? new Date(completionDate) : new Date(today());
+    const due = parseDate(dueDate);
+    const completed = completionDate ? parseDate(completionDate) : parseDate(today());
     const isLate = completed > due;
     lateChk.checked = isLate;
     lateBadge.style.display = isLate ? 'inline' : 'none';
@@ -3418,7 +3496,7 @@ function performance() {
         const bw = getEmployeeBandwidth(e.id,today());
         const myAdhoc = STATE.adhocTasks.filter(t=>t.assignedTo===e.id&&t.year===y&&t.month===m);
         const adhocDone = myAdhoc.filter(t=>t.status==='Completed').length;
-        const leaves = STATE.leaves.filter(l=>l.employeeId===e.id&&new Date(l.date).getFullYear()===y&&new Date(l.date).getMonth()===m);
+        const leaves = STATE.leaves.filter(l=>l.employeeId===e.id&&parseDate(l.date).getFullYear()===y&&parseDate(l.date).getMonth()===m);
         return `<div class="card">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
             <div class="avatar" style="width:44px;height:44px;font-size:17px">${initials(e.name)}</div>
@@ -3780,6 +3858,194 @@ function deleteTeam(id) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// PAGE: PROJECTS
+// Admin/Manager creates a project (date range) and assigns each member a FIXED number of
+// planned hours per working day for that range. Those hours are counted in
+// getEmployeeBandwidth() (via getProjectHours) like regular-report and adhoc hours, so they
+// reduce the member's available capacity on every working day in the range. Weekends,
+// holidays and leave days are excluded. Only "Active" projects count toward capacity.
+// ═══════════════════════════════════════════════════════════
+const PROJECT_STATUSES = ['Active','On Hold','Completed'];
+
+function eligibleProjectEmployees() {
+  return visibleEmployees().filter(e => e.status==='active' && e.role!=='manager');
+}
+function visibleProjects() {
+  if(isAdmin()) return STATE.projects;
+  const ids = new Set(visibleEmployees().map(e => e.id));
+  const me = STATE.currentUser && STATE.currentUser.authUid;
+  return STATE.projects.filter(p => (me && p.createdBy === me) || (p.allocations||[]).some(a => ids.has(a.employeeId)));
+}
+function projectPhase(p) {
+  const st = p.status || 'Active', t = today();
+  if(st === 'Completed') return {label:'Completed', cls:'badge-gray'};
+  if(st === 'On Hold')   return {label:'On Hold',   cls:'badge-amber'};
+  if(t < p.startDate)    return {label:'Upcoming',  cls:'badge-blue'};
+  if(t > p.endDate)      return {label:'Ended',     cls:'badge-gray'};
+  return {label:'Running', cls:'badge-green'};
+}
+function countWorkingDaysBetween(startStr, endStr) {
+  const s = parseDate(startStr), e = parseDate(endStr);
+  if(isNaN(s) || isNaN(e) || e < s) return 0;
+  let n = 0, guard = 0;
+  for(const d = new Date(s); d <= e && guard < 4000; d.setDate(d.getDate()+1), guard++) { if(isWorkingDay(d)) n++; }
+  return n;
+}
+
+function projects() {
+  const list = visibleProjects().slice().sort((a,b) => (b.startDate||'').localeCompare(a.startDate||''));
+  const t = today();
+  const running = list.filter(p => projectPhase(p).label === 'Running').length;
+  let hoursToday = 0;
+  eligibleProjectEmployees().forEach(e => { hoursToday += getEmployeeBandwidth(e.id, t).project || 0; });
+  const empName = id => { const e = STATE.employees.find(x => x.id === id); return e ? e.name : 'Removed employee'; };
+
+  document.getElementById('content').innerHTML = `
+    <div class="section-header">
+      <h2>Projects</h2>
+      <button class="btn btn-primary" onclick="openProjectModal()">
+        <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        New Project
+      </button>
+    </div>
+
+    <div class="alert alert-info" style="margin-bottom:20px">
+      Assign each member a fixed number of hours per working day for the project's date range. Those hours are added to their
+      daily workload in the Capacity Planner automatically (weekends, holidays and leave days are skipped; only <strong>Active</strong> projects count).
+    </div>
+
+    <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
+      ${kpiCard('Projects', list.length, 'In your view', '#0B4EA2','#EEF2FF', svgChart())}
+      ${kpiCard('Running Today', running, 'Active & in date range', '#0D9488','#CCFBF1', svgFlash())}
+      ${kpiCard('Project Hours Today', fmtH(hoursToday)+'h', 'Across team members', '#F59E0B','#FEF3C7', svgClock())}
+    </div>
+
+    <div class="card">
+      <div class="card-header"><div class="card-title">All Projects</div></div>
+      ${list.length === 0
+        ? `<div class="empty-state"><p>No projects yet</p><small>Click "New Project" to add one and assign hours to team members</small></div>`
+        : `<div class="table-wrap"><table>
+            <thead><tr><th>Project</th><th>Dates</th><th>Status</th><th>Team &amp; hours/day</th><th>Total h/day</th><th>Actions</th></tr></thead>
+            <tbody>
+              ${list.map(p => {
+                const ph = projectPhase(p);
+                const al = p.allocations || [];
+                const total = al.reduce((s,a) => s + (parseFloat(a.hoursPerDay)||0), 0);
+                return `<tr>
+                  <td><strong>${escHtml(p.name)}</strong>${p.description ? `<div style="font-size:12px;color:var(--text3);max-width:260px">${escHtml(p.description)}</div>` : ''}</td>
+                  <td style="white-space:nowrap">${escHtml(p.startDate)} → ${escHtml(p.endDate)}<div style="font-size:12px;color:var(--text3)">${countWorkingDaysBetween(p.startDate, p.endDate)} working days</div></td>
+                  <td><span class="badge ${ph.cls}">${ph.label}</span></td>
+                  <td>${al.length ? al.map(a => `<div style="font-size:13px">${escHtml(empName(a.employeeId))} <span style="color:var(--text3)">· ${fmtH(a.hoursPerDay)}h</span></div>`).join('') : '<span style="color:var(--text3)">—</span>'}</td>
+                  <td><strong>${fmtH(total)}h</strong></td>
+                  <td><div style="display:flex;gap:6px">
+                    <button class="btn btn-secondary btn-sm" onclick="openProjectModal('${p.id}')">Edit</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteProject('${p.id}')">Delete</button>
+                  </div></td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table></div>`}
+    </div>
+  `;
+}
+
+function openProjectModal(id) {
+  const p = id ? STATE.projects.find(x => x.id === id) : null;
+  const emps = eligibleProjectEmployees();
+  const hoursOf = eid => { const a = ((p && p.allocations) || []).find(x => x.employeeId === eid); return a ? a.hoursPerDay : null; };
+  openModal(p ? 'Edit Project' : 'New Project', `
+    <div class="form-grid">
+      <div class="form-group">
+        <label class="form-label">Project Name *</label>
+        <input class="form-control" id="f-pname" placeholder="e.g. Warehouse Migration" value="${escHtml(p ? p.name : '')}"/>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description</label>
+        <input class="form-control" id="f-pdesc" placeholder="Optional" value="${escHtml(p ? (p.description||'') : '')}"/>
+      </div>
+      <div class="form-grid form-grid-2">
+        <div class="form-group">
+          <label class="form-label">Start Date *</label>
+          <input class="form-control" id="f-pstart" type="date" value="${p ? p.startDate : today()}"/>
+        </div>
+        <div class="form-group">
+          <label class="form-label">End Date *</label>
+          <input class="form-control" id="f-pend" type="date" value="${p ? p.endDate : ''}"/>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Status</label>
+        <select class="form-control" id="f-pstatus">
+          ${PROJECT_STATUSES.map(st => `<option value="${st}" ${(p ? (p.status||'Active') : 'Active') === st ? 'selected' : ''}>${st}</option>`).join('')}
+        </select>
+        <small style="color:var(--text3)">Only Active projects reduce capacity. Set On Hold or Completed to release the hours.</small>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Team members &amp; planned hours per working day *</label>
+        <div style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:4px 10px">
+          ${emps.length === 0 ? '<div style="padding:10px;color:var(--text3)">No active team members available</div>' : emps.map(e => {
+            const h = hoursOf(e.id), on = h !== null;
+            return `<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border)">
+              <input type="checkbox" id="pa-chk-${e.id}" ${on ? 'checked' : ''} onchange="document.getElementById('pa-hrs-${e.id}').disabled=!this.checked"/>
+              <label for="pa-chk-${e.id}" style="flex:1;cursor:pointer;font-size:13px">${escHtml(e.name)} <span style="color:var(--text3)">· ${escHtml(e.team||'—')} · ${fmtH(e.loginHours||8)}h/day</span></label>
+              <input class="form-control" id="pa-hrs-${e.id}" type="number" min="0.25" max="12" step="0.25" value="${on ? h : 1}" ${on ? '' : 'disabled'} style="width:84px;padding:5px 8px"/>
+              <span style="font-size:12px;color:var(--text3)">h/day</span>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+    </div>`,
+    [{cls:'btn-secondary', label:'Cancel', fn:'closeModal()'},
+     {cls:'btn-primary', label: p ? 'Save Changes' : 'Create Project', fn:`saveProject('${p ? p.id : ''}')`}],
+    true);
+}
+
+function saveProject(id) {
+  const name = document.getElementById('f-pname').value.trim();
+  const description = document.getElementById('f-pdesc').value.trim();
+  const startDate = document.getElementById('f-pstart').value;
+  const endDate = document.getElementById('f-pend').value;
+  const status = document.getElementById('f-pstatus').value;
+  if(!name) { toast('Project name is required', 'error'); return; }
+  if(!startDate || !endDate) { toast('Start and end dates are required', 'error'); return; }
+  if(endDate < startDate) { toast('End date must be on or after the start date', 'error'); return; }
+
+  const existing = id ? STATE.projects.find(p => p.id === id) : null;
+  const editable = eligibleProjectEmployees();
+  const editableIds = new Set(editable.map(e => e.id));
+  // keep allocations for people this user can't see/edit (e.g. another team's members)
+  const allocations = ((existing && existing.allocations) || []).filter(a => !editableIds.has(a.employeeId));
+  for(const e of editable) {
+    const chk = document.getElementById('pa-chk-' + e.id);
+    if(!chk || !chk.checked) continue;
+    const hrs = parseFloat(document.getElementById('pa-hrs-' + e.id).value);
+    const cap = parseFloat(e.loginHours) || 8;
+    if(!(hrs > 0) || hrs > 12) { toast(`${e.name}: enter hours per day between 0.25 and 12`, 'error'); return; }
+    if(hrs > cap) { toast(`${e.name} logs ${fmtH(cap)}h/day — project hours can't exceed that`, 'error'); return; }
+    allocations.push({employeeId: e.id, hoursPerDay: Math.round(hrs*100)/100});
+  }
+  if(!allocations.length) { toast('Assign at least one team member', 'error'); return; }
+
+  if(existing) {
+    Object.assign(existing, {name, description, startDate, endDate, status, allocations});
+    toast('Project updated', 'success');
+  } else {
+    STATE.projects.push({id: uid(), name, description, startDate, endDate, status, allocations,
+      createdAt: today(), createdBy: (STATE.currentUser && STATE.currentUser.authUid) || ''});
+    toast('Project created', 'success');
+  }
+  save(); closeModal(); projects();
+}
+
+function deleteProject(id) {
+  const p = STATE.projects.find(x => x.id === id);
+  if(!p) return;
+  if(!confirm(`Delete project "${p.name}"? Its planned hours will be removed from everyone's capacity.`)) return;
+  STATE.projects = STATE.projects.filter(x => x.id !== id);
+  save(); toast('Project deleted', 'info'); projects();
+}
+
+// ═══════════════════════════════════════════════════════════
 // PAGE: HOLIDAYS
 // ═══════════════════════════════════════════════════════════
 function holidays() {
@@ -3802,7 +4068,7 @@ function holidays() {
               STATE.holidays.sort((a,b)=>a.date.localeCompare(b.date)).map(h=>`<tr>
                 <td style="font-weight:600">${h.date}</td>
                 <td>${h.name}</td>
-                <td style="color:var(--text3)">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(h.date).getDay()]}</td>
+                <td style="color:var(--text3)">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][parseDate(h.date).getDay()]}</td>
                 <td><button class="btn btn-danger btn-sm" onclick="deleteHoliday('${h.id}')">Remove</button></td>
               </tr>`).join('')}
           </tbody>
@@ -3905,14 +4171,14 @@ function closeModalOutside(e) {
 function exportCSV() {
   const y=STATE.currentYear, m=STATE.currentMonth;
   const activeEmps = STATE.employees.filter(e=>e.status==='active');
-  const rows = [['Employee','Team','Designation','Perf Score','Quality Score','Utilization%','Assigned Reports','Adhoc Tasks']];
+  const rows = [['Employee','Team','Designation','Perf Score','Quality Score','Utilization%','Assigned Reports','Adhoc Tasks','Project Hrs Today']];
   activeEmps.forEach(e=>{
     const ps=getPerformanceScore(e.id,y,m);
     const qs=getQualityScore(e.id,y,m);
     const bw=getEmployeeBandwidth(e.id,today());
     const reps=STATE.assignments.filter(a=>a.employeeId===e.id).length;
     const adhoc=STATE.adhocTasks.filter(t=>t.assignedTo===e.id&&t.year===y&&t.month===m).length;
-    rows.push([e.name,e.team||'',e.designation||'',ps,qs,bw.pct,reps,adhoc]);
+    rows.push([e.name,e.team||'',e.designation||'',ps,qs,bw.pct,reps,adhoc,bw.project||0]);
   });
   const csv = rows.map(r=>r.join(',')).join('\n');
   const blob = new Blob([csv],{type:'text/csv'});
@@ -3983,7 +4249,7 @@ function seedData() {
   ];
 
   // Sample adhoc tasks
-  const y=new Date().getFullYear(), m=new Date().getMonth();
+  const y=nowET().getFullYear(), m=nowET().getMonth();
   STATE.adhocTasks = [
     {id:uid(),taskId:'ADH001',name:'Q3 Executive Deck',requestor:'CEO',category:'Executive Request',description:'Q3 performance deck for board',estHours:4,assignedDate:today(),dueDate:today(),status:'In Progress',assignedTo:emps[0].id,year:y,month:m,createdAt:today()},
     {id:uid(),taskId:'ADH002',name:'Customer Segmentation Pull',requestor:'Marketing',category:'Data Pull',description:'Segment data pull',estHours:2,assignedDate:today(),dueDate:today(),status:'Completed',assignedTo:emps[1].id,year:y,month:m,completionDate:today(),actualHours:1.5,createdAt:today()},
