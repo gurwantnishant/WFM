@@ -193,13 +193,48 @@ let _initialLoadDone = false; // kept for readability at existing call sites
 let _remoteCache = {};
 function _clone(v) { return JSON.parse(JSON.stringify(v)); }
 
+// ─── 3-WAY MERGE HELPERS (lost-update protection) ────────────
+// Every collection is stored as ONE row ({items:[…]}). If two people change
+// the same collection at about the same time, a plain "last write wins" upsert
+// silently deletes the other person's change — e.g. a member closes a report,
+// then a manager's/another member's write lands with an older copy of the list
+// and the report "re-opens". To prevent that, changes are merged BY RECORD ID:
+// we work out what THIS browser changed (added / edited / removed records
+// compared with the last copy it saw) and re-apply only those changes on top
+// of the newest copy from the database.
+function _canMergeById(arr) { return Array.isArray(arr) && arr.every(x => x && typeof x === 'object' && x.id != null); }
+function _diffById(base, cur) {
+  const baseMap = new Map(base.map(x => [x.id, JSON.stringify(x)]));
+  const curIds = new Set(cur.map(x => x.id));
+  return {
+    upserts: cur.filter(x => !baseMap.has(x.id) || baseMap.get(x.id) !== JSON.stringify(x)),
+    removed: new Set(base.filter(x => !curIds.has(x.id)).map(x => x.id))
+  };
+}
+function _applyDiffById(items, d) {
+  const out = items.filter(x => !d.removed.has(x.id));
+  const idx = new Map(out.map((x, i) => [x.id, i]));
+  d.upserts.forEach(x => { if(idx.has(x.id)) out[idx.get(x.id)] = x; else { idx.set(x.id, out.length); out.push(x); } });
+  return out;
+}
+// newRemote + (what we changed locally since `base`) → merged list
+function _rebaseItems(newRemote, base, local) {
+  if(!_canMergeById(newRemote) || !_canMergeById(base) || !_canMergeById(local)) return newRemote;
+  return _applyDiffById(newRemote, _diffById(base, local));
+}
+
 function _applyRow(key, data) {
   if(key === 'settings') {
     STATE.settings = Object.assign({}, STATE.settings, data || {});
     _remoteCache.settings = _clone(STATE.settings);
   } else if(DATA_DOC_KEYS.includes(key)) {
     const items = Array.isArray(data && data.items) ? data.items : [];
-    STATE[key] = items;
+    // Keep this browser's not-yet-saved changes instead of throwing them away
+    // (a realtime update from someone else, or the echo of our own previous
+    // write, used to replace STATE wholesale and wipe an in-flight change).
+    STATE[key] = (_initialLoadDone && _remoteCache[key] !== undefined)
+      ? _rebaseItems(items, _remoteCache[key], STATE[key])
+      : items;
     _remoteCache[key] = _clone(items);
   }
 }
@@ -318,53 +353,86 @@ function stopSync() {
 // something navigation-risky right after saving — e.g. firing a mailto:
 // link, which can interrupt an in-flight request in some browsers — should
 // `await save()` first rather than treating it as fire-and-forget.
+let _saveChain = Promise.resolve();
+// Saves are queued one after another so two quick clicks can never land out of order.
 function save() {
+  _saveChain = _saveChain.then(_doSave).catch(e => { console.error('[SUPABASE] save chain error:', e); });
+  return _saveChain;
+}
+
+async function _doSave() {
   if(isLoading) {
     // Should not be reachable — the login/app UI stays hidden until initial
     // load completes — but this is the hard backstop against ever writing
     // a half-loaded/empty STATE over real Supabase data.
     console.warn('[SUPABASE] save() called before initial data finished loading — ignoring to protect existing data');
-    return Promise.resolve();
+    return;
   }
   const changes = [];
+  const merge = {};   // key → {base, snapshot} for collections merged by id
   DATA_DOC_KEYS.forEach(key => {
     if(JSON.stringify(STATE[key]) !== JSON.stringify(_remoteCache[key])) {
       changes.push({ key, data: { items: STATE[key] } });
+      if(_canMergeById(STATE[key]) && _canMergeById(_remoteCache[key])) merge[key] = { base: _remoteCache[key], snapshot: _clone(STATE[key]) };
     }
   });
   if(JSON.stringify(STATE.settings) !== JSON.stringify(_remoteCache.settings)) {
     changes.push({ key: 'settings', data: STATE.settings });
   }
-  if(changes.length===0) { console.log('[SUPABASE] save() called with no changes — skipping write'); return Promise.resolve(); }
+  if(changes.length===0) { console.log('[SUPABASE] save() called with no changes — skipping write'); return; }
 
   const changedKeys = changes.map(c => c.key);
   console.log('[SUPABASE] Saving', changedKeys.join(', '));
   isSaving = true;
   setSyncStatus('saving');
-  return sb.from(DATA_TABLE).upsert(changes, { onConflict: 'key' }).then(({ error }) => {
+
+  // Read the newest copy of each changed collection and re-apply ONLY our
+  // changes on top of it, so we never overwrite someone else's record.
+  const merged = {};
+  try {
+    for(const key of Object.keys(merge)) {
+      const { data: row, error: rErr } = await sb.from(DATA_TABLE).select('data').eq('key', key).maybeSingle();
+      if(rErr) throw rErr;
+      const remoteItems = row && row.data && Array.isArray(row.data.items) ? row.data.items : null;
+      const m = (remoteItems && _canMergeById(remoteItems))
+        ? _applyDiffById(remoteItems, _diffById(merge[key].base, merge[key].snapshot))
+        : merge[key].snapshot;
+      merged[key] = m;
+      changes.find(c => c.key === key).data = { items: m };
+    }
+  } catch(error) {
     isSaving = false;
-    if(error) {
-      // A failed write must never be reported as a success elsewhere — this
-      // is the one place save() resolves, and it always surfaces failure
-      // clearly rather than swallowing it.
-      console.error('[SUPABASE] Save FAILED:', changedKeys.join(', '), error);
-      setSyncStatus('error', error.message || String(error));
-      toast('Save failed — check your connection', 'error');
+    console.error('[SUPABASE] Pre-save read FAILED:', error);
+    setSyncStatus('error', error.message || String(error));
+    toast('Save failed — check your connection', 'error');
+    return;
+  }
+
+  const { error } = await sb.from(DATA_TABLE).upsert(changes, { onConflict: 'key' });
+  isSaving = false;
+  if(error) {
+    // A failed write must never be reported as a success elsewhere.
+    console.error('[SUPABASE] Save FAILED:', changedKeys.join(', '), error);
+    setSyncStatus('error', error.message || String(error));
+    toast('Save failed — check your connection', 'error');
+    return;
+  }
+  console.log('[SUPABASE] Save successful:', changedKeys.join(', '));
+  setSyncStatus('saved');
+  let needsRender = false;
+  changes.forEach(c => {
+    if(c.key === 'settings') { _remoteCache.settings = _clone(STATE.settings); return; }
+    if(merged[c.key]) {
+      // Our changes are now in the database together with anyone else's.
+      // Bring STATE up to date, keeping anything the user changed while the write was in flight.
+      _remoteCache[c.key] = _clone(merged[c.key]);
+      const next = _rebaseItems(merged[c.key], merge[c.key].snapshot, STATE[c.key]);
+      if(JSON.stringify(next) !== JSON.stringify(STATE[c.key])) { STATE[c.key] = next; needsRender = true; }
     } else {
-      console.log('[SUPABASE] Save successful:', changedKeys.join(', '));
-      setSyncStatus('saved');
-      // Update _remoteCache immediately rather than waiting on the realtime
-      // echo of this write to come back and call _applyRow(). Waiting on
-      // the echo left a window where a second save() fired right after
-      // (e.g. the notification log write that follows an ad-hoc acceptance)
-      // would re-diff against stale data and re-send a row that had, in
-      // fact, already saved successfully.
-      changes.forEach(c => {
-        if(c.key === 'settings') _remoteCache.settings = _clone(STATE.settings);
-        else _remoteCache[c.key] = _clone(STATE[c.key]);
-      });
+      _remoteCache[c.key] = _clone(STATE[c.key]);
     }
   });
+  if(needsRender && _initialLoadDone) render();
 }
 
 // ─── UTILS ──────────────────────────────────────────────────
@@ -2512,9 +2580,9 @@ function adhoc() {
           <input type="checkbox" id="f-show-completed" ${STATE.showCompletedAdhoc?'checked':''} onchange="toggleShowCompletedAdhoc()"/>
           Show Completed (${completedCount})
         </label>` : ''}
-        <button class="btn btn-primary" onclick="${isMember() ? "navigate(\'adhoc\')" : "openAdhocModal()"}">
+        <button class="btn btn-primary" onclick="openAdhocModal()">
           <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          ${isMember() ? 'My Tasks' : 'Create Ad Hoc Task'}
+          ${isMember() ? 'Add My Task' : 'Create Ad Hoc Task'}
         </button>
       </div>
     </div>
@@ -2548,12 +2616,12 @@ function adhoc() {
                 <td>${t.status!=='Completed' ? '<span style="color:var(--text3)">—</span>' : survey ? `<span class="survey-score-pill">★ ${survey.score}/100</span>` : '<span class="badge badge-amber">Pending</span>'}</td>
                 <td><div style="display:flex;gap:6px;flex-wrap:wrap">
                   ${isMember() && isTaskPendingAcceptance(t) ? `<button class="btn btn-primary btn-sm" onclick="respondToAdhoc('${t.id}','Accepted')">Accept</button><button class="btn btn-danger btn-sm" onclick="respondToAdhoc('${t.id}','Rejected')">Reject</button>` : ''}
-                  ${!isMember() ? `<button class="btn btn-secondary btn-sm" onclick="openAdhocModal('${t.id}')">Edit</button>` : ''}
+                  ${(!isMember() || t.selfCreated) ? `<button class="btn btn-secondary btn-sm" onclick="openAdhocModal('${t.id}')">Edit</button>` : ''}
                   ${!isTaskPendingAcceptance(t) && t.assignmentStatus !== 'Rejected' ? `<button class="btn btn-teal btn-sm" onclick="updateTaskStatus('${t.id}')">Status</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-secondary btn-sm" onclick="sendSurveyEmailToOutlook('${t.id}')" title="Open a new Outlook email to the requestor with the click-to-reply survey copied to your clipboard">✉ Email</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-secondary btn-sm" onclick="copySurveyToClipboard('${t.id}')" title="Re-copy the survey if it didn't paste in last time">⧉ Copy Survey</button>` : ''}
                   ${t.status==='Completed' ? `<button class="btn btn-primary btn-sm" onclick="openSurveyModal('${t.id}')">${survey ? '★ Update' : '★ Record'}</button>` : ''}
-                  <button class="btn btn-danger btn-sm" onclick="deleteAdhoc('${t.id}')">✕</button>
+                  ${(!isMember() || t.selfCreated) ? `<button class="btn btn-danger btn-sm" onclick="deleteAdhoc('${t.id}')">✕</button>` : ''}
                 </div></td>
               </tr>`;
             }).join('')}
@@ -2589,8 +2657,8 @@ function onAssignedDateChange() {
 }
 
 function openAdhocModal(id) {
-  if(isMember() && !id) { toast('Ad hoc tasks are assigned by your manager','info'); return; }
   const task = id ? STATE.adhocTasks.find(t=>t.id===id) : null;
+  if(isMember() && id && (!task || task.assignedTo!==myEmpId() || !task.selfCreated)) { toast('You can only edit tasks you created for yourself','error'); return; }
   const cats = ['Data Pull','Analysis Request','Executive Request','Automation Enhancement'];
   const statuses = ['Not Started','In Progress','Completed','Delayed','Cancelled'];
   openModal(isMember() ? (task?'Edit My Task':'Add Task for Myself') : (task?'Edit Adhoc Task':'Create Adhoc Task'), `
@@ -2800,7 +2868,7 @@ function saveAdhoc(id) {
   if(isMember()) {
     if(id) {
       const existing = STATE.adhocTasks.find(t=>t.id===id);
-      if(!existing || existing.assignedTo !== myEmpId()) { toast('You can only edit your own tasks','error'); return; }
+      if(!existing || existing.assignedTo !== myEmpId() || !existing.selfCreated) { toast('You can only edit tasks you created for yourself','error'); return; }
     }
   }
   const reqSkillsEl = document.getElementById('f-treq-skills');
@@ -2848,7 +2916,7 @@ function saveAdhoc(id) {
     }
     toast('Task updated','success');
   } else {
-    const newTask = {...fields, id:uid(), createdAt:today(), status: isMember() ? fields.status : 'Awaiting Acceptance', assignmentStatus: isMember() ? 'Accepted' : 'Pending Acceptance', responseAt:null, responseComment:''};
+    const newTask = {...fields, id:uid(), createdAt:today(), status: isMember() ? fields.status : 'Awaiting Acceptance', assignmentStatus: isMember() ? 'Accepted' : 'Pending Acceptance', selfCreated: isMember(), responseAt:null, responseComment:''};
     STATE.adhocTasks.push(newTask);
     if(newTask.status === 'Completed') justCompletedId = newTask.id;
     toast('Task created','success');
@@ -3375,7 +3443,7 @@ function saveSurveyResponse(taskId) {
 function deleteAdhoc(id) {
   if(isMember()) {
     const existing = STATE.adhocTasks.find(t=>t.id===id);
-    if(!existing || existing.assignedTo !== myEmpId()) { toast('You can only delete your own tasks','error'); return; }
+    if(!existing || existing.assignedTo !== myEmpId() || !existing.selfCreated) { toast('You can only delete tasks you created for yourself','error'); return; }
   }
   STATE.adhocTasks = STATE.adhocTasks.filter(t=>t.id!==id);
   save(); toast('Task deleted','info'); adhoc();
