@@ -355,9 +355,11 @@ function stopSync() {
 // `await save()` first rather than treating it as fire-and-forget.
 let _saveChain = Promise.resolve();
 // Saves are queued one after another so two quick clicks can never land out of order.
+// Resolves to true when the write landed (or there was nothing to write), false when it failed.
 function save() {
-  _saveChain = _saveChain.then(_doSave).catch(e => { console.error('[SUPABASE] save chain error:', e); });
-  return _saveChain;
+  const p = _saveChain.then(_doSave).catch(e => { console.error('[SUPABASE] save chain error:', e); return false; });
+  _saveChain = p;
+  return p;
 }
 
 async function _doSave() {
@@ -366,7 +368,7 @@ async function _doSave() {
     // load completes — but this is the hard backstop against ever writing
     // a half-loaded/empty STATE over real Supabase data.
     console.warn('[SUPABASE] save() called before initial data finished loading — ignoring to protect existing data');
-    return;
+    return false;
   }
   const changes = [];
   const merge = {};   // key → {base, snapshot} for collections merged by id
@@ -379,7 +381,7 @@ async function _doSave() {
   if(JSON.stringify(STATE.settings) !== JSON.stringify(_remoteCache.settings)) {
     changes.push({ key: 'settings', data: STATE.settings });
   }
-  if(changes.length===0) { console.log('[SUPABASE] save() called with no changes — skipping write'); return; }
+  if(changes.length===0) { console.log('[SUPABASE] save() called with no changes — skipping write'); return true; }
 
   const changedKeys = changes.map(c => c.key);
   console.log('[SUPABASE] Saving', changedKeys.join(', '));
@@ -404,8 +406,8 @@ async function _doSave() {
     isSaving = false;
     console.error('[SUPABASE] Pre-save read FAILED:', error);
     setSyncStatus('error', error.message || String(error));
-    toast('Save failed — check your connection', 'error');
-    return;
+    toast('NOT SAVED — ' + (error.message || 'check your connection'), 'error', 10000);
+    return false;
   }
 
   const { error } = await sb.from(DATA_TABLE).upsert(changes, { onConflict: 'key' });
@@ -414,8 +416,8 @@ async function _doSave() {
     // A failed write must never be reported as a success elsewhere.
     console.error('[SUPABASE] Save FAILED:', changedKeys.join(', '), error);
     setSyncStatus('error', error.message || String(error));
-    toast('Save failed — check your connection', 'error');
-    return;
+    toast('NOT SAVED — ' + (error.message || 'check your connection'), 'error', 10000);
+    return false;
   }
   console.log('[SUPABASE] Save successful:', changedKeys.join(', '));
   setSyncStatus('saved');
@@ -433,6 +435,7 @@ async function _doSave() {
     }
   });
   if(needsRender && _initialLoadDone) render();
+  return true;
 }
 
 // ─── UTILS ──────────────────────────────────────────────────
@@ -523,14 +526,14 @@ function onMonthChange() {
 }
 
 // ─── TOAST ──────────────────────────────────────────────────
-function toast(msg, type='info') {
+function toast(msg, type='info', ms=3000) {
   const c = document.getElementById('toast-container');
   const t = document.createElement('div');
   t.className = `toast ${type}`;
   const icons = {success:'✓', error:'✗', info:'ℹ'};
   t.innerHTML = `<span>${icons[type]||'ℹ'}</span><span>${msg}</span>`;
   c.appendChild(t);
-  setTimeout(()=>{ t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(()=>t.remove(),300); }, 3000);
+  setTimeout(()=>{ t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(()=>t.remove(),300); }, ms);
 }
 
 // ─── NAVIGATION ─────────────────────────────────────────────
@@ -1518,8 +1521,8 @@ function dashboard() {
         </div>
         ${myTasks.filter(t=>!isTaskPendingAcceptance(t)).length===0
           ? '<div class="empty-state"><p>No accepted open tasks assigned to you</p></div>'
-          : '<div class="table-wrap"><table><thead><tr><th>Task</th><th>Sales Org</th><th>Category</th><th>Due</th><th>Status</th></tr></thead><tbody>'
-            + myTasks.filter(t=>!isTaskPendingAcceptance(t)).slice(0,5).map(t=>`<tr>
+          : '<div class="table-wrap" style="max-height:340px;overflow-y:auto"><table><thead><tr style="position:sticky;top:0;background:var(--surface,#fff);z-index:1"><th>Task</th><th>Sales Org</th><th>Category</th><th>Due</th><th>Status</th></tr></thead><tbody>'
+            + myTasks.filter(t=>!isTaskPendingAcceptance(t)).slice().reverse().map(t=>`<tr>
                 <td><strong>${t.name}</strong></td><td><span class="badge badge-teal">${t.salesOrg||'—'}</span></td>
                 <td><span class="badge badge-blue">${t.category||'—'}</span></td>
                 <td>${t.dueDate||'—'}</td>
@@ -2872,7 +2875,7 @@ function selectRec(empId, el) {
   document.getElementById('f-tassign').value = empId;
 }
 
-function saveAdhoc(id) {
+async function saveAdhoc(id) {
   if(isMember()) {
     if(id) {
       const existing = STATE.adhocTasks.find(t=>t.id===id);
@@ -2913,6 +2916,16 @@ function saveAdhoc(id) {
     toast('Due date cannot be before the assigned date', 'error');
     return;
   }
+  // Admin/manager assigning a task to THEMSELVES: nobody else needs to accept it,
+  // so it is accepted automatically (no "Awaiting Acceptance" step).
+  const selfAssignedByLead = !isMember() && !!myEmpId() && fields.assignedTo === myEmpId();
+  if(selfAssignedByLead) {
+    fields.assignmentStatus = 'Accepted';
+    const prev = id ? STATE.adhocTasks.find(t=>t.id===id) : null;   // keep a start date already recorded on edit
+    fields.acceptedHours    = fields.estHours;
+    fields.startDate        = prev?.startDate || fields.assignedDate || today();
+    fields.expectedEndDate  = fields.dueDate || fields.startDate;
+  }
   let justCompletedId = null;
   if(id) {
     const idx=STATE.adhocTasks.findIndex(t=>t.id===id);
@@ -2922,14 +2935,18 @@ function saveAdhoc(id) {
       const nowCompleted = STATE.adhocTasks[idx].status === 'Completed';
       if(nowCompleted && !wasCompleted) justCompletedId = STATE.adhocTasks[idx].id;
     }
-    toast('Task updated','success');
   } else {
-    const newTask = {...fields, id:uid(), createdAt:today(), status: isMember() ? fields.status : 'Awaiting Acceptance', assignmentStatus: isMember() ? 'Accepted' : 'Pending Acceptance', selfCreated: isMember(), responseAt:null, responseComment:''};
+    const newTask = {...fields, id:uid(), createdAt:today(), status: (isMember() || selfAssignedByLead) ? fields.status : 'Awaiting Acceptance', assignmentStatus: (isMember() || selfAssignedByLead) ? 'Accepted' : 'Pending Acceptance', selfCreated: isMember(), responseAt:null, responseComment:''};
     STATE.adhocTasks.push(newTask);
     if(newTask.status === 'Completed') justCompletedId = newTask.id;
-    toast('Task created','success');
   }
-  save(); closeModal(); adhoc();
+  closeModal(); adhoc();
+  const saved = await save();
+  if(!saved) {
+    toast('Task is NOT saved to the server yet. Do not close or refresh this page — check your connection and try again.', 'error', 10000);
+    return;
+  }
+  toast(id ? 'Task updated' : 'Task created','success');
   if(justCompletedId) {
     sendSurveyEmailToOutlook(justCompletedId);
   }
