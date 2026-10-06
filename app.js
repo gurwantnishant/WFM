@@ -1255,7 +1255,8 @@ function memberReportsCard(empId) {
 
 
 // ── Manager / admin: Team Report Tracker ────────────────────
-// Pending  = not closed and due today or earlier (Overdue / Due Today)
+// Pending  = not closed and due before today (Overdue)
+// Due Today = every report whose due date is today (open ones first, closed ones after)
 // Upcoming = not closed and due after today
 // Closed   = completed (On Time or Late)
 function setTeamReportFilter(f) { STATE.reportTeamFilter = f; render(); }
@@ -1268,17 +1269,24 @@ function teamReportsCard() {
   const rows = [];
   team.forEach(e => getReportOccurrences(e.id, y, m).forEach(o => rows.push({emp:e, o})));
   const isClosed  = r => !!r.o.completion;
-  const isPending = r => !r.o.completion && r.o.dueDate <= t;
+  const isPending = r => !r.o.completion && r.o.dueDate <  t;
   const isUpcoming= r => !r.o.completion && r.o.dueDate >  t;
-  const counts = {pending:rows.filter(isPending).length, upcoming:rows.filter(isUpcoming).length, closed:rows.filter(isClosed).length, all:rows.length};
+  // Due Today: always based on the real current date, regardless of the month selected in the dashboard
+  const _td = parseDate(t);
+  let dueTodayRows;
+  if(_td.getFullYear()===y && _td.getMonth()===m) dueTodayRows = rows.filter(r=>r.o.dueDate===t);
+  else { dueTodayRows = []; team.forEach(e => getReportOccurrences(e.id, _td.getFullYear(), _td.getMonth()).forEach(o => { if(o.dueDate===t) dueTodayRows.push({emp:e, o}); })); }
+  const counts = {pending:rows.filter(isPending).length, duetoday:dueTodayRows.filter(r=>!r.o.completion).length, upcoming:rows.filter(isUpcoming).length, closed:rows.filter(isClosed).length, all:rows.length};
   const overdue = rows.filter(r=>r.o.status==='Overdue').length;
   const late = rows.filter(r=>r.o.status==='Late').length;
 
   const f = STATE.reportTeamFilter || 'pending';
   const empSel = STATE.reportTeamEmp || '';
-  let shown = rows.filter(r => (empSel ? r.emp.id===empSel : true) &&
-    (f==='pending' ? isPending(r) : f==='upcoming' ? isUpcoming(r) : f==='closed' ? isClosed(r) : true));
-  shown.sort((a,b) => f==='closed'
+  let shown = (f==='duetoday' ? dueTodayRows : rows).filter(r => (empSel ? r.emp.id===empSel : true) &&
+    (f==='duetoday' ? true : f==='pending' ? isPending(r) : f==='upcoming' ? isUpcoming(r) : f==='closed' ? isClosed(r) : true));
+  shown.sort((a,b) => f==='duetoday'
+    ? (!!a.o.completion - !!b.o.completion) || a.emp.name.localeCompare(b.emp.name)
+    : f==='closed'
     ? (b.o.completion.completedAt||b.o.completion.completedDate).localeCompare(a.o.completion.completedAt||a.o.completion.completedDate)
     : a.o.dueDate.localeCompare(b.o.dueDate) || a.emp.name.localeCompare(b.emp.name));
 
@@ -1290,7 +1298,7 @@ function teamReportsCard() {
         <div style="font-size:12px;color:var(--text3);margin-top:3px">${selectedMonthLabel()} · ${team.length} team member${team.length!==1?'s':''} · ${overdue} overdue · ${late} closed late</div>
       </div>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        ${tab('pending','Pending')}${tab('upcoming','Upcoming')}${tab('closed','Closed')}${tab('all','All')}
+        ${tab('pending','Pending')}${tab('duetoday','Due Today')}${tab('upcoming','Upcoming')}${tab('closed','Closed')}${tab('all','All')}
         <select class="form-control" style="width:auto;padding:5px 8px;font-size:12px" onchange="setTeamReportEmp(this.value)">
           <option value="">All employees</option>
           ${team.map(e=>`<option value="${e.id}" ${empSel===e.id?'selected':''}>${escHtml(e.name)}</option>`).join('')}
@@ -1298,7 +1306,7 @@ function teamReportsCard() {
       </div>
     </div>
     ${shown.length===0
-      ? `<div class="empty-state"><p>No ${f==='all'?'':f+' '}reports for ${selectedMonthLabel()}</p></div>`
+      ? `<div class="empty-state"><p>${f==='duetoday' ? 'No reports are due today' : `No ${f==='all'?'':f+' '}reports for ${selectedMonthLabel()}`}</p></div>`
       : `<div class="table-wrap"><table><thead><tr><th>Employee</th><th>Report</th><th>Period</th><th>Due</th><th>Priority</th><th>Status</th><th>Action</th></tr></thead><tbody>
         ${shown.map(({emp,o})=>`<tr>
           <td><strong>${escHtml(emp.name)}</strong><br><small style="color:var(--text3)">${escHtml(emp.team||'')}</small></td>
