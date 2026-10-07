@@ -2720,7 +2720,7 @@ function openAdhocModal(id) {
         </div>
         <div class="form-group">
           <label class="form-label">Assigned Date</label>
-          <input class="form-control" id="f-tasgd" type="date" min="${today()}" value="${task?.assignedDate||today()}" onchange="onAssignedDateChange()"/>
+          <input class="form-control" id="f-tasgd" type="date" ${task ? 'disabled title="Assigned date is fixed once the task is created" style="background:#F3F4F6;color:#9CA3AF;cursor:not-allowed"' : `min="${today()}"`} value="${task?.assignedDate||today()}" onchange="onAssignedDateChange()"/>
         </div>
         <div class="form-group">
           <label class="form-label">Due Date</label>
@@ -2908,7 +2908,8 @@ async function saveAdhoc(id) {
   if(!fields.salesOrg) { toast('Sales Organization is required','error'); return; }
   if(!fields.assignedTo) { toast('Please assign the task to an employee','error'); return; }
   const todayStr = today();
-  if(fields.assignedDate && fields.assignedDate < todayStr) {
+  // Assigned date is locked on edit, so only validate it for new tasks
+  if(!id && fields.assignedDate && fields.assignedDate < todayStr) {
     toast('Assigned date cannot be in the past', 'error');
     return;
   }
