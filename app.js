@@ -458,6 +458,19 @@ function daysInMonth(y,m) { return new Date(y, m+1, 0).getDate(); }
 function isWeekend(d) { const day=d.getDay(); return day===0||day===6; }
 function isHoliday(dateStr) { return STATE.holidays.some(h=>h.date===dateStr); }
 function isWorkingDay(d) { return !isWeekend(d) && !isHoliday(fmtDate(d)); }
+// Signed number of WORKING days (Mon–Fri, minus Holiday Calendar) between two YYYY-MM-DD dates.
+// to after from  → working days in (from, to]   (positive)
+// to before from → working days in (to, from]   (negative)
+function businessDaysDiff(fromStr, toStr) {
+  const a = parseDate(fromStr), b = parseDate(toStr);
+  if(isNaN(a) || isNaN(b) || a.getTime()===b.getTime()) return 0;
+  const sign = b > a ? 1 : -1;
+  const lo = sign>0 ? a : b, hi = sign>0 ? b : a;
+  let n = 0, guard = 0;
+  const d = new Date(lo); d.setDate(d.getDate()+1);
+  for(; d <= hi && guard < 4000; d.setDate(d.getDate()+1), guard++) { if(isWorkingDay(d)) n++; }
+  return sign*n;
+}
 
 function getWorkingDays(year, month) {
   const days=[];
@@ -956,11 +969,23 @@ function dueDayLabel(dateStr) {
   return WEEKDAY_SHORT[d.getDay()] + ' ' + shortDate(d);
 }
 function dueRelativeText(dateStr) {
-  const diff = Math.round((parseDate(dateStr) - parseDate(today())) / 86400000);
-  if(diff===0) return 'due today';
-  if(diff===1) return 'due tomorrow';
-  if(diff>1)   return 'due in '+diff+' days';
-  return Math.abs(diff)+' day'+(Math.abs(diff)===1?'':'s')+' overdue';
+  const t = today();
+  if(dateStr===t) return 'due today';
+  const diff = businessDaysDiff(t, dateStr);
+  const n = Math.abs(diff), w = n+' working day'+(n===1?'':'s');
+  if(dateStr > t) return 'due in '+w;
+  return n===0 ? 'overdue (no working day elapsed)' : w+' overdue';   // working days, not calendar days
+}
+// Adhoc delay (working days): open tasks show time to / past the date in the Due column; completed tasks show how late they closed
+function adhocDelayHtml(t) {
+  const due = t.expectedEndDate || t.dueDate;
+  if(!due || t.status==='Cancelled' || taskAssignmentLabel(t)==='Rejected') return '';
+  if(t.status==='Completed') {
+    const done = t.completionDate;
+    const n = done && done > due ? businessDaysDiff(due, done) : 0;
+    return n>0 ? `<div style="font-size:11px;color:#B91C1C;margin-top:2px">closed ${n} working day${n===1?'':'s'} late</div>` : '';
+  }
+  return `<div style="font-size:11px;color:${due<today()?'#B91C1C':'var(--text3)'};margin-top:2px">${dueRelativeText(due)}</div>`;
 }
 // Due cell: weekly reports show the weekday; open reports also show how far away / overdue
 function reportDueCell(o) {
@@ -1342,6 +1367,35 @@ function getProjectHours(empId, dateStr) {
   return h;
 }
 
+// Adhoc task hours that land on ONE date. Total hours (accepted hours, else estimate) are split evenly
+// across the working days of start..end (inclusive), where start/end are the employee's accepted
+// start / expected end (falling back to assigned / due date before acceptance).
+//  - weekends, holidays and the employee's leave days get no hours (hours go to the remaining days)
+//  - nothing is planned after the end date, even if the task is still open
+//  - start = end → all hours on that day
+function getAdhocHoursOn(t, empId, dateStr) {
+  const total = parseFloat(t.acceptedHours) || parseFloat(t.estHours) || 0;
+  if(!total) return 0;
+  const startStr = t.startDate || t.assignedDate;
+  if(!startStr) return 0;
+  let endStr = t.expectedEndDate || t.dueDate || startStr;
+  if(endStr < startStr) endStr = startStr;
+  if(dateStr < startStr || dateStr > endStr) return 0;
+  const s = parseDate(startStr), e = parseDate(endStr);
+  if(isNaN(s) || isNaN(e)) return 0;
+  const workDays = [];
+  for(let d = new Date(s), g = 0; d <= e && g < 4000; d.setDate(d.getDate()+1), g++) { if(isWorkingDay(d)) workDays.push(fmtDate(d)); }
+  if(!workDays.length) {   // range is only weekend/holiday days → plan it on the last working day before the end date
+    const d = new Date(e);
+    for(let i=0; i<10 && !isWorkingDay(d); i++) d.setDate(d.getDate()-1);
+    workDays.push(fmtDate(d));
+  }
+  const leaveDates = new Set(STATE.leaves.filter(l=>l.employeeId===empId).map(l=>l.date));
+  let days = workDays.filter(x=>!leaveDates.has(x));
+  if(!days.length) days = workDays;   // on leave for the whole range: keep the load visible rather than dropping it
+  return days.includes(dateStr) ? total/days.length : 0;
+}
+
 function getEmployeeBandwidth(empId, dateStr) {
   const emp = STATE.employees.find(e=>e.id===empId);
   if(!emp || emp.status==='inactive') return {total:0, regular:0, adhoc:0, project:0, leave:0, available:0, pct:100};
@@ -1361,10 +1415,10 @@ function getEmployeeBandwidth(empId, dateStr) {
     if(rep && isReportDueOn(rep, dateStr, wdNum)) regHrs += parseFloat(rep.estHours)||0;
   });
 
-  // Adhoc tasks assigned for this date
+  // Adhoc tasks: hours are spread evenly over the task's working days (see getAdhocHoursOn)
   let adhocHrs = 0;
-  STATE.adhocTasks.filter(t=>t.assignedTo===empId && t.assignedDate===dateStr && !['Completed','Cancelled'].includes(t.status))
-    .forEach(t=>{ adhocHrs += parseFloat(t.estHours)||0; });
+  STATE.adhocTasks.filter(t=>t.assignedTo===empId && !['Completed','Cancelled'].includes(t.status))
+    .forEach(t=>{ adhocHrs += getAdhocHoursOn(t, empId, dateStr); });
 
   // Project hours: fixed planned hours/day for every working day inside an Active project's date range
   const projHrs = getProjectHours(empId, dateStr);
@@ -2620,7 +2674,7 @@ function adhoc() {
                 <td><span class="badge badge-blue">${t.category||'—'}</span></td>
                 <td>${emp ? `<div style="display:flex;align-items:center;gap:6px"><div class="avatar" style="width:24px;height:24px;font-size:9px">${initials(emp.name)}</div>${emp.name}</div>` : '<span style="color:var(--text3)">Unassigned</span>'}</td>
                 <td style="font-weight:600">${t.acceptedHours||t.estHours}h${t.acceptedHours?'<div style="font-size:10px;color:var(--text3)">accepted</div>':''}</td>
-                <td>${t.expectedEndDate||t.dueDate||'—'}</td>
+                <td>${t.expectedEndDate||t.dueDate||'—'}${adhocDelayHtml(t)}</td>
                 <td>${assignmentBadge(taskAssignmentLabel(t))}</td>
                 <td><span class="badge ${statusBadge(t.status)}">${t.status}</span></td>
                 <td><span class="badge ${critBadge(t.criticality)}">${t.criticality||'—'}</span></td>
