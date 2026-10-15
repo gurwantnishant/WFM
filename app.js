@@ -742,7 +742,7 @@ function myEmpId()   { return STATE.currentUser?.empId; }
 function myTeam()    { return STATE.currentUser?.team; }
 
 // Adhoc assignment workflow
-const SALES_ORGS = ['BCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
+const SALES_ORGS = ['PCEC','PCONA','PESNA','PPNDA','PAVNA','PIDSA'];
 const ADHOC_ASSIGNMENT_STATUSES = ['Pending Acceptance','Accepted','Rejected'];
 
 function taskAssignmentLabel(t) {
