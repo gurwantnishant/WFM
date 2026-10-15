@@ -2721,6 +2721,43 @@ function onAssignedDateChange() {
   }
 }
 
+// ── Sales Org multi-select (checkbox dropdown) ──
+// The selection is stored in task.salesOrg as a comma-separated string (e.g. "PCEC, PESNA"),
+// so existing single-value tasks and every place that displays t.salesOrg keep working.
+function parseSalesOrgs(val) {
+  return String(val||'').split(',').map(x=>x.trim()).filter(x=>SALES_ORGS.includes(x));
+}
+function salesOrgMultiSelectHtml(current) {
+  const selected = parseSalesOrgs(current);
+  return `
+    <div id="f-tsalesorg-wrap">
+      <button type="button" class="form-control" id="f-tsalesorg-btn" onclick="toggleSalesOrgMenu()"
+        style="display:flex;justify-content:space-between;align-items:center;text-align:left;cursor:pointer;width:100%">
+        <span id="f-tsalesorg-label">${selected.length ? escHtml(selected.join(', ')) : '— Select Sales Organization(s) —'}</span>
+        <span style="font-size:10px;margin-left:8px">▾</span>
+      </button>
+      <div id="f-tsalesorg-menu" style="display:none;margin-top:4px;border:1px solid var(--border);border-radius:8px;background:var(--surface,#fff);padding:4px 0">
+        ${SALES_ORGS.map(o=>`
+          <label style="display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;font-size:13px;font-weight:400;margin:0">
+            <input type="checkbox" class="f-tsalesorg-cb" value="${o}" ${selected.includes(o)?'checked':''} onchange="updateSalesOrgLabel()"/>
+            ${o}
+          </label>`).join('')}
+      </div>
+    </div>`;
+}
+function toggleSalesOrgMenu() {
+  const m = document.getElementById('f-tsalesorg-menu');
+  if(m) m.style.display = m.style.display==='none' ? 'block' : 'none';
+}
+function getSelectedSalesOrgs() {
+  return [...document.querySelectorAll('.f-tsalesorg-cb:checked')].map(cb=>cb.value);
+}
+function updateSalesOrgLabel() {
+  const sel = getSelectedSalesOrgs();
+  const el = document.getElementById('f-tsalesorg-label');
+  if(el) el.textContent = sel.length ? sel.join(', ') : '— Select Sales Organization(s) —';
+}
+
 function openAdhocModal(id) {
   const task = id ? STATE.adhocTasks.find(t=>t.id===id) : null;
   if(isMember() && id && (!task || task.assignedTo!==myEmpId() || !task.selfCreated)) { toast('You can only edit tasks you created for yourself','error'); return; }
@@ -2740,11 +2777,8 @@ function openAdhocModal(id) {
       </div>
       <div class="form-grid form-grid-3">
         <div class="form-group">
-          <label class="form-label">Sales Organization *</label>
-          <select class="form-control" id="f-tsalesorg">
-            <option value="">— Select Sales Organization —</option>
-            ${SALES_ORGS.map(o=>`<option value="${o}" ${task?.salesOrg===o?'selected':''}>${o}</option>`).join('')}
-          </select>
+          <label class="form-label">Sales Organization(s) *</label>
+          ${salesOrgMultiSelectHtml(task?.salesOrg)}
         </div>
         <div class="form-group">
           <label class="form-label">Requestor</label>
@@ -2940,7 +2974,7 @@ async function saveAdhoc(id) {
   const fields = {
     taskId:         document.getElementById('f-tid').value.trim(),
     name:           document.getElementById('f-tname').value.trim(),
-    salesOrg:       document.getElementById('f-tsalesorg').value,
+    salesOrg:       getSelectedSalesOrgs().join(', '),
     requestor:      document.getElementById('f-treq').value.trim(),
     requestorEmail: document.getElementById('f-tremail').value.trim(),
     category:       document.getElementById('f-tcat').value,
@@ -2959,7 +2993,7 @@ async function saveAdhoc(id) {
     month:          STATE.currentMonth
   };
   if(!fields.name) { toast('Task name required','error'); return; }
-  if(!fields.salesOrg) { toast('Sales Organization is required','error'); return; }
+  if(!fields.salesOrg) { toast('Select at least one Sales Organization','error'); return; }
   if(!fields.assignedTo) { toast('Please assign the task to an employee','error'); return; }
   const todayStr = today();
   // Assigned date is locked on edit, so only validate it for new tasks
